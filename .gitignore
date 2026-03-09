@@ -1,0 +1,7 @@
+node_modules
+CLAUDE.md
+bot_debug.log
+bot.log
+server/
+check_proto.js
+check_version.js

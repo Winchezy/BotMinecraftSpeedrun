@@ -1,0 +1,11 @@
+const { createBot } = require('./src/bot');
+
+// Arguments de ligne de commande pour host/port/username
+const args = process.argv.slice(2);
+let host = args[0] || '127.0.0.1';
+if (host === 'localhost') host = '127.0.0.1'; // Force IPv4
+const port = parseInt(args[1]) || 25565;
+const username = args[2] || 'SpeedrunBot';
+
+console.log(`Starting bot on ${host}:${port} as ${username}`);
+createBot(host, port, username);
