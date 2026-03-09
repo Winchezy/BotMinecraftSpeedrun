@@ -38,4 +38,3 @@ node index.js localhost 12345 RunnerBot
 - Recherche de lave pour le portail du Nether.
 - Navigation dans le Nether (Forteresse).
 - Stronghold et Dragon.
-# BotMinecraftSpeedrun
