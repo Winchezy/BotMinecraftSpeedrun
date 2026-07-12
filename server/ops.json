@@ -1,0 +1,14 @@
+[
+  {
+    "uuid": "75e7cbe1-35ab-3814-bd23-42262d3884ee",
+    "name": "Winchezy",
+    "level": 4,
+    "bypassesPlayerLimit": false
+  },
+  {
+    "uuid": "d93284f7-93e0-3658-a318-25e8c038f020",
+    "name": "SpeedBot",
+    "level": 4,
+    "bypassesPlayerLimit": false
+  }
+]

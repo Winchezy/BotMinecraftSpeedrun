@@ -1,0 +1,3 @@
+@echo off
+echo Starting Log Viewer...
+node log_viewer.js

@@ -1,0 +1,82 @@
+[20:01:11] [ServerMain/INFO]: Environment: Environment[sessionHost=https://sessionserver.mojang.com, servicesHost=https://api.minecraftservices.com, name=PROD]
+[20:01:13] [ServerMain/INFO]: Loaded 7 recipes
+[20:01:14] [ServerMain/INFO]: Loaded 1271 advancements
+[20:01:14] [Server thread/INFO]: Starting minecraft server version 1.20.4
+[20:01:14] [Server thread/INFO]: Loading properties
+[20:01:14] [Server thread/INFO]: Default game type: SURVIVAL
+[20:01:14] [Server thread/INFO]: Generating keypair
+[20:01:14] [Server thread/INFO]: Starting Minecraft server on *:25565
+[20:01:14] [Server thread/INFO]: Using default channel type
+[20:01:14] [Server thread/WARN]: **** SERVER IS RUNNING IN OFFLINE/INSECURE MODE!
+[20:01:14] [Server thread/WARN]: The server will make no attempt to authenticate usernames. Beware.
+[20:01:14] [Server thread/WARN]: While this makes the game possible to play without internet access, it also opens up the ability for hackers to connect with any username they choose.
+[20:01:14] [Server thread/WARN]: To change this, set "online-mode" to "true" in the server.properties file.
+[20:01:14] [Server thread/INFO]: Preparing level "world"
+[20:01:15] [Server thread/INFO]: Preparing start region for dimension minecraft:overworld
+[20:01:19] [Worker-Main-5/INFO]: Preparing spawn area: 0%
+[20:01:19] [Worker-Main-4/INFO]: Preparing spawn area: 0%
+[20:01:19] [Worker-Main-13/INFO]: Preparing spawn area: 0%
+[20:01:19] [Worker-Main-3/INFO]: Preparing spawn area: 0%
+[20:01:19] [Worker-Main-11/INFO]: Preparing spawn area: 0%
+[20:01:19] [Worker-Main-4/INFO]: Preparing spawn area: 0%
+[20:01:19] [Worker-Main-3/INFO]: Preparing spawn area: 0%
+[20:01:19] [Worker-Main-12/INFO]: Preparing spawn area: 0%
+[20:01:19] [Worker-Main-4/INFO]: Preparing spawn area: 15%
+[20:01:20] [Server thread/INFO]: Time elapsed: 4498 ms
+[20:01:20] [Server thread/INFO]: Done (5.402s)! For help, type "help"
+[20:01:31] [Server thread/INFO]: Winchezy[/127.0.0.1:60838] logged in with entity id 239 at (-5.703096127892312, 73.37347314468633, -7.737409407902722)
+[20:01:31] [Server thread/INFO]: Winchezy joined the game
+[20:02:58] [Server thread/INFO]: SpeedBot[/127.0.0.1:50257] logged in with entity id 339 at (2.3, 70.41999998688698, -5.500993198709842)
+[20:02:58] [Server thread/INFO]: SpeedBot joined the game
+[20:03:06] [Server thread/INFO]: [Winchezy: Teleported Winchezy to SpeedBot]
+[20:03:06] [Server thread/WARN]: Winchezy moved too quickly! -4.097698664939348,-4.25741895194993,13.512098925047884
+[20:54:41] [Server thread/INFO]: SpeedBot was blown up by Creeper
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:54:41] [Server thread/WARN]: SpeedBot moved too quickly! 20.62506046185716,27.0,21.059865261698818
+[20:55:25] [Server thread/INFO]: [Not Secure] <SpeedBot> [Survival] Engaging skeleton
+[20:55:40] [Server thread/INFO]: [Not Secure] <SpeedBot> [Survival] Threat cleared.
+[20:55:43] [Server thread/INFO]: [Not Secure] <SpeedBot> [Survival] Engaging zombie
+[20:55:54] [Server thread/INFO]: SpeedBot was blown up by Creeper
+[20:55:58] [Server thread/INFO]: [Not Secure] <SpeedBot> [Survival] Engaging spider
+[20:56:07] [Server thread/WARN]: SpeedBot moved wrongly!
+[20:56:08] [Server thread/WARN]: SpeedBot moved wrongly!
+[20:56:16] [Server thread/INFO]: SpeedBot was shot by Skeleton
+[20:56:19] [Server thread/INFO]: [Not Secure] <SpeedBot> [Survival] Threat cleared.
+[20:57:19] [Server thread/INFO]: SpeedBot lost connection: Timed out
+[20:57:19] [Server thread/INFO]: SpeedBot left the game
+[20:58:14] [Server thread/INFO]: SpeedBot[/127.0.0.1:63840] logged in with entity id 7518 at (-11.7, 73.85489329934836, 1.3)
+[20:58:14] [Server thread/INFO]: SpeedBot joined the game
+[20:58:32] [Server thread/INFO]: [Not Secure] <SpeedBot> [Survival] Engaging skeleton
+[20:59:15] [Server thread/INFO]: [Not Secure] <SpeedBot> [Survival] Threat cleared.
+[21:02:36] [Server thread/INFO]: [Not Secure] <SpeedBot> [Survival] Engaging zombie
+[21:02:57] [Server thread/INFO]: [Not Secure] <SpeedBot> [Survival] Threat cleared.

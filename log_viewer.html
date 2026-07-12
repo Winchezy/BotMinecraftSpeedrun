@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="fr">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bot Minecraft - Logs Debug</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        header {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 15px;
+            padding: 20px 30px;
+            margin-bottom: 20px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+        }
+
+        h1 {
+            color: white;
+            font-size: 2em;
+            margin-bottom: 10px;
+        }
+
+        .stats {
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+
+        .stat {
+            background: rgba(255, 255, 255, 0.2);
+            padding: 10px 20px;
+            border-radius: 10px;
+            color: white;
+            font-weight: bold;
+        }
+
+        .stat span {
+            color: #ffd700;
+            font-size: 1.2em;
+            margin-left: 5px;
+        }
+
+        .controls {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 15px;
+            padding: 15px 30px;
+            margin-bottom: 20px;
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .filter-btn {
+            background: rgba(255, 255, 255, 0.2);
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            color: white;
+            padding: 10px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: all 0.3s;
+        }
+
+        .filter-btn:hover {
+            background: rgba(255, 255, 255, 0.3);
+            transform: translateY(-2px);
+        }
+
+        .filter-btn.active {
+            background: #4ade80;
+            border-color: #22c55e;
+        }
+
+        #clearBtn {
+            background: #ef4444;
+            border-color: #dc2626;
+            margin-left: auto;
+        }
+
+        #clearBtn:hover {
+            background: #dc2626;
+        }
+
+        .log-container {
+            background: #1a1a1a;
+            border-radius: 15px;
+            padding: 20px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            height: calc(100vh - 300px);
+            overflow-y: auto;
+            font-family: 'Consolas', 'Monaco', monospace;
+        }
+
+        .log-line {
+            color: #e0e0e0;
+            padding: 5px 10px;
+            margin: 2px 0;
+            border-radius: 4px;
+            font-size: 13px;
+            line-height: 1.5;
+            transition: background 0.2s;
+        }
+
+        .log-line:hover {
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        .log-line.error {
+            background: rgba(239, 68, 68, 0.2);
+            border-left: 4px solid #ef4444;
+            color: #fca5a5;
+        }
+
+        .log-line.combat {
+            background: rgba(251, 146, 60, 0.2);
+            border-left: 4px solid #fb923c;
+            color: #fdba74;
+        }
+
+        .log-line.mining {
+            background: rgba(74, 222, 128, 0.2);
+            border-left: 4px solid #4ade80;
+            color: #86efac;
+        }
+
+        .log-line.survival {
+            background: rgba(96, 165, 250, 0.2);
+            border-left: 4px solid #60a5fa;
+            color: #93c5fd;
+        }
+
+        .log-line.new {
+            animation: fadeIn 0.3s;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateX(-10px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+
+        .empty-state {
+            text-align: center;
+            color: #888;
+            padding: 50px;
+            font-size: 1.2em;
+        }
+
+        ::-webkit-scrollbar {
+            width: 10px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 10px;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>🤖 Bot Minecraft - Logs Debug</h1>
+            <div class="stats">
+                <div class="stat">Total: <span id="statTotal">0</span></div>
+                <div class="stat">Erreurs: <span id="statErrors">0</span></div>
+                <div class="stat">Combat: <span id="statCombat">0</span></div>
+                <div class="stat">Mining: <span id="statMining">0</span></div>
+                <div class="stat">Survival: <span id="statSurvival">0</span></div>
+            </div>
+        </header>
+
+        <div class="controls">
+            <button id="toggleLogsBtn" class="filter-btn" style="background: #10b981; border-color: #059669;">
+                🔴 Activer les logs
+            </button>
+            <span id="statusIndicator" style="color: white; font-weight: bold; margin-left: 10px;">⚫ Déconnecté</span>
+            <button class="filter-btn active" data-filter="all">Tous</button>
+            <button class="filter-btn" data-filter="error">Erreurs</button>
+            <button class="filter-btn" data-filter="combat">Combat</button>
+            <button class="filter-btn" data-filter="mining">Mining</button>
+            <button class="filter-btn" data-filter="survival">Survival</button>
+            <button id="copyBtn" class="filter-btn" style="background: #8b5cf6; border-color: #7c3aed;">📋
+                Copier</button>
+            <button id="clearBtn" class="filter-btn">🗑️ Clear</button>
+        </div>
+
+        <div class="log-container" id="logContainer">
+            <div class="empty-state">Cliquez sur "Activer les logs" pour commencer...</div>
+        </div>
+    </div>
+
+    <script>
+        let currentFilter = 'all';
+        let autoScroll = true;
+        let eventSource = null;
+        let isConnected = false;
+        const logContainer = document.getElementById('logContainer');
+        const toggleBtn = document.getElementById('toggleLogsBtn');
+        const statusIndicator = document.getElementById('statusIndicator');
+
+        // Toggle logs connection
+        toggleBtn.addEventListener('click', () => {
+            if (isConnected) {
+                disconnectLogs();
+            } else {
+                connectLogs();
+            }
+        });
+
+        function connectLogs() {
+            if (eventSource) return;
+
+            logContainer.innerHTML = '<div class="empty-state">Chargement des logs...</div>';
+            eventSource = new EventSource('/logs/stream');
+
+            eventSource.onopen = () => {
+                isConnected = true;
+                toggleBtn.innerHTML = '🟢 Désactiver les logs';
+                toggleBtn.style.background = '#ef4444';
+                toggleBtn.style.borderColor = '#dc2626';
+                statusIndicator.innerHTML = '🟢 Connecté';
+                statusIndicator.style.color = '#4ade80';
+            };
+
+            eventSource.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+
+                if (data.type === 'initial') {
+                    data.lines.forEach(line => {
+                        if (line.trim()) addLogLine(line);
+                    });
+                } else if (data.type === 'new') {
+                    if (data.line.trim()) addLogLine(data.line, true);
+                }
+            };
+
+            eventSource.onerror = () => {
+                console.error('Connection error');
+                disconnectLogs();
+            };
+        }
+
+        function disconnectLogs() {
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+            isConnected = false;
+            toggleBtn.innerHTML = '🔴 Activer les logs';
+            toggleBtn.style.background = '#10b981';
+            toggleBtn.style.borderColor = '#059669';
+            statusIndicator.innerHTML = '⚫ Déconnecté';
+            statusIndicator.style.color = 'white';
+        }
+
+        // Filter buttons
+        document.querySelectorAll('.filter-btn[data-filter]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.querySelectorAll('.filter-btn[data-filter]').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                currentFilter = btn.dataset.filter;
+                applyFilter();
+            });
+        });
+
+        // Copy button
+        document.getElementById('copyBtn').addEventListener('click', () => {
+            const visibleLines = Array.from(logContainer.querySelectorAll('.log-line'))
+                .filter(line => line.style.display !== 'none')
+                .map(line => line.textContent)
+                .join('\n');
+
+            if (visibleLines) {
+                navigator.clipboard.writeText(visibleLines).then(() => {
+                    const copyBtn = document.getElementById('copyBtn');
+                    const originalText = copyBtn.innerHTML;
+                    copyBtn.innerHTML = '✅ Copié!';
+                    copyBtn.style.background = '#22c55e';
+                    setTimeout(() => {
+                        copyBtn.innerHTML = originalText;
+                        copyBtn.style.background = '#8b5cf6';
+                    }, 2000);
+                }).catch(err => {
+                    alert('Erreur lors de la copie: ' + err);
+                });
+            } else {
+                alert('Aucun log à copier');
+            }
+        });
+
+        // Clear button
+        document.getElementById('clearBtn').addEventListener('click', () => {
+            logContainer.innerHTML = '<div class="empty-state">Logs effacés. Cliquez sur "Activer les logs" pour recharger.</div>';
+        });
+
+        // Detect user scroll
+        logContainer.addEventListener('scroll', () => {
+            const isScrolledToBottom = logContainer.scrollHeight - logContainer.clientHeight <= logContainer.scrollTop + 50;
+            autoScroll = isScrolledToBottom;
+        });
+
+        function getLogClass(line) {
+            if (line.includes('Error') || line.includes('error') || line.includes('CRITICAL')) return 'error';
+            if (line.includes('Combat') || line.includes('HOSTILE') || line.includes('Threat') || line.includes('Retreat')) return 'combat';
+            if (line.includes('Mine_') || line.includes('Dig') || line.includes('STAIRCASE')) return 'mining';
+            if (line.includes('[Survival]')) return 'survival';
+            return '';
+        }
+
+        function shouldShowLine(line, className) {
+            if (currentFilter === 'all') return true;
+            return className === currentFilter;
+        }
+
+        function applyFilter() {
+            const lines = logContainer.querySelectorAll('.log-line');
+            lines.forEach(line => {
+                const classes = Array.from(line.classList);
+                const className = classes.find(c => c !== 'log-line' && c !== 'new');
+                line.style.display = shouldShowLine(line.textContent, className) ? 'block' : 'none';
+            });
+        }
+
+        function addLogLine(text, isNew = false) {
+            const emptyState = logContainer.querySelector('.empty-state');
+            if (emptyState) emptyState.remove();
+
+            const className = getLogClass(text);
+            const line = document.createElement('div');
+            line.className = `log-line ${className}${isNew ? ' new' : ''}`;
+            line.textContent = text;
+
+            if (shouldShowLine(text, className)) {
+                logContainer.appendChild(line);
+
+                if (autoScroll) {
+                    logContainer.scrollTop = logContainer.scrollHeight;
+                }
+            } else {
+                line.style.display = 'none';
+                logContainer.appendChild(line);
+            }
+        }
+
+        // Fetch stats
+        function updateStats() {
+            fetch('/logs/stats')
+                .then(r => r.json())
+                .then(stats => {
+                    document.getElementById('statTotal').textContent = stats.totalLines;
+                    document.getElementById('statErrors').textContent = stats.errors;
+                    document.getElementById('statCombat').textContent = stats.combat;
+                    document.getElementById('statMining').textContent = stats.mining;
+                    document.getElementById('statSurvival').textContent = stats.survival;
+                })
+                .catch(() => { }); // Ignore errors when stats unavailable
+        }
+
+        updateStats();
+        setInterval(updateStats, 5000);
+    </script>
+</body>
+
+</html>

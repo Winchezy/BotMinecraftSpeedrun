@@ -1,0 +1,27 @@
+{
+  "name": "botminecraftspeedrun",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "express": "^5.2.1",
+    "minecraft-data": "^3.102.0",
+    "minecraft-protocol": "^1.62.0",
+    "mineflayer": "^4.33.0",
+    "mineflayer-armor-manager": "^2.0.1",
+    "mineflayer-collectblock": "^1.6.0",
+    "mineflayer-pathfinder": "^2.4.5",
+    "mineflayer-pvp": "^1.3.2",
+    "mineflayer-tool": "^1.2.0",
+    "prismarine-viewer": "^1.33.0",
+    "tail": "^2.2.6",
+    "vec3": "^0.1.10"
+  }
+}
