@@ -1,5 +1,9 @@
 const Task = require('../lib/Task');
 const Vec3 = require('vec3').Vec3;
+const { routeThreats } = require('../lib/MobSafety');
+const { threatNearPath, threatNearPoint } = require('../lib/MobSafety');
+const { goals } = require('mineflayer-pathfinder');
+const { existingPassageMovements, planCompletePath, withTimeout } = require('../lib/Pathing');
 
 // Descente en escalier 1x1, robuste :
 // - direction VERROUILLEE au 1er tick (evite la derive erratique quand Survival
@@ -8,10 +12,13 @@ const Vec3 = require('vec3').Vec3;
 // - detection des liquides (on ne creuse pas dans l'eau/lave, on contourne),
 // - vrai "bridging" des vides/grottes (pose reelle d'un bloc).
 class DigDown extends Task {
-    constructor(bot, targetY) {
+    constructor(bot, targetY, oreName = targetY >= 0 ? 'iron_ore' : 'diamond_ore') {
         super(bot);
         this.name = 'DigDown';
         this.targetY = targetY;
+        this.oreName = oreName;
+        this.caveMoves = 0;
+        this.visitedCaves = new Set();
         this.mcData = require('minecraft-data')(bot.version);
         this.dir = null;       // direction de l'escalier, verrouillee
         this.turns = 0;        // nb de contournements consecutifs
@@ -27,11 +34,14 @@ class DigDown extends Task {
     async safeDig(block) {
         if (!this.isSolid(block)) return true;
         if (block.name === 'bedrock' || block.name.includes('lava')) return false;
+        const threat = threatNearPoint(this.bot,this.bot.entity.position,0,[block.position]);
+        if (threat) {
+            console.log(`[DigDown] Bloc ${block.position} refuse : acces possible pour ${threat.name}.`);
+            this.fail('Mobs sur le trajet apres ouverture du bloc');
+            return false;
+        }
         try {
-            await Promise.race([
-                this.bot.dig(block),
-                new Promise((_, rej) => setTimeout(() => rej(new Error('dig timeout')), 8000))
-            ]);
+            await withTimeout(this.bot,this.bot.dig(block),8000,'dig timeout');
             this.digFails = 0; // succes -> reset
             return true;
         } catch (e) {
@@ -48,7 +58,24 @@ class DigDown extends Task {
     }
 
     async run() {
+        // Ne jamais calculer une nouvelle marche pendant une chute ou un saut.
+        // floored() donnerait alors une hauteur intermediaire, pas celle du palier.
+        if (this.bot.entity.onGround === false) return;
         const pos = this.bot.entity.position;
+        if (this.bot.inventory?.items) {
+            const picks = this.bot.inventory.items().filter(i => i.name.endsWith('_pickaxe'));
+            const remaining = picks.reduce((n, i) => n + (i.maxDurability == null ? Infinity :
+                Math.max(0, i.maxDurability - (i.durabilityUsed || 0))), 0);
+            const reserve = Math.max(32, Math.ceil(Math.max(0, 70 - pos.y) * 2) + 16);
+            if (remaining < reserve) {
+                this.fail('Reserve de pioche pour la remontee');
+                return;
+            }
+        }
+        if (threatNearPoint(this.bot,pos)) {
+            this.fail('Mobs sur le trajet de descente');
+            return;
+        }
         if (pos.y <= this.targetY) {
             console.log(`[DigDown] Profondeur atteinte (Y=${Math.floor(pos.y)}).`);
             this.complete();
@@ -68,17 +95,19 @@ class DigDown extends Task {
             return;
         }
 
-        // Diamants a proximite ? on s'arrete pour les miner.
-        const diamondIds = [
-            this.mcData.blocksByName.diamond_ore?.id,
-            this.mcData.blocksByName.deepslate_diamond_ore?.id
+        // Seul le minerai demande par l'etape peut interrompre cette recherche.
+        const oreIds = [
+            this.mcData.blocksByName[this.oreName]?.id,
+            this.mcData.blocksByName[`deepslate_${this.oreName}`]?.id
         ].filter(x => x != null);
-        const diamond = this.bot.findBlock({ matching: diamondIds, maxDistance: 4 });
-        if (diamond) {
-            console.log(`[DigDown] Diamant repere a ${diamond.position} !`);
+        const ore = this.bot.findBlock({ matching: oreIds, maxDistance: 4 });
+        if (ore && !threatNearPoint(this.bot, ore.position, 3)) {
+            console.log(`[DigDown] ${this.oreName} repere a ${ore.position} !`);
+            this.bot.caveMiningTarget = { oreName: this.oreName, position: ore.position.clone() };
             this.complete();
             return;
         }
+        if (this.caveMoves < 3 && await this.followCave(oreIds)) return;
 
         // Pioche obligatoire.
         const pickaxe = this.bot.inventory.items().find(i => i.name.includes('pickaxe'));
@@ -173,16 +202,79 @@ class DigDown extends Task {
         return false;
     }
 
+    async followCave(oreIds) {
+        const origin = this.bot.entity.position;
+        const detected = this.bot.findBlocks({ matching: oreIds, maxDistance: 32, count: 12 })
+            .filter(p => !threatNearPoint(this.bot, p, 3));
+        const floors = this.bot.findBlocks({
+            matching: ['stone', 'deepslate', 'dirt', 'grass_block', 'tuff'].map(n => this.mcData.blocksByName[n]?.id).filter(n => n != null),
+            maxDistance: 32, count: 64,
+            useExtraInfo: block => {
+                if (!block?.position) return false;
+                const feet = block.position.offset(0, 1, 0);
+                const head = this.bot.blockAt(feet.offset(0, 1, 0));
+                return feet.y <= origin.y && origin.distanceTo(feet) > 4 &&
+                    this.bot.blockAt(feet)?.name === 'air' && head?.name === 'air' &&
+                    head.skyLight < 12;
+            }
+        }).map(p => p.offset(0, 1, 0)).filter(p => !this.visitedCaves.has(p.toString()));
+        // Une grotte pres du filon requis passe avant une grotte seulement profonde.
+        const score = p => detected.length ? Math.min(...detected.map(ore => ore.distanceTo(p))) : p.y;
+        floors.sort((a, b) => score(a) - score(b));
+        const original = this.bot.pathfinder.movements;
+        const walking = existingPassageMovements(this.bot);
+        for (const point of floors.slice(0, 12)) {
+            if (threatNearPoint(this.bot, point, 3)) continue;
+            const goal = new goals.GoalNear(point.x, point.y, point.z, 1);
+            const route = await planCompletePath(this.bot, goal, 800, walking);
+            if (route.status !== 'success' || threatNearPath(this.bot, route.path)) continue;
+            this.visitedCaves.add(point.toString());
+            this.caveMoves++;
+            this.bot.chat(`[SpeedBot] Grotte accessible : recherche de ${this.oreName}.`);
+            this.bot.pathfinder.setMovements(walking);
+            try {
+                await withTimeout(this.bot, this.bot.pathfinder.goto(goal), 15000, 'Acces a la grotte bloque');
+                const vein = detected.sort((a, b) => a.distanceTo(point) - b.distanceTo(point))[0];
+                if (vein) {
+                    this.bot.caveMiningTarget = { oreName: this.oreName, position: vein.clone() };
+                    this.bot.chat(`[SpeedBot] Filon de ${this.oreName} repere : approche depuis la grotte.`);
+                    this.complete();
+                }
+            } catch (error) { console.log(`[DigDown] ${error.message}`); }
+            finally { if (this.bot.pathfinder.movements === walking) this.bot.pathfinder.setMovements(original); }
+            return true;
+        }
+        this.caveMoves = 3;
+        this.bot.chat(`[SpeedBot] Pas de grotte accessible ici pour ${this.oreName} : descente en escalier.`);
+        return false;
+    }
+
     async stepInto(floor) {
         const walk = floor.offset(0.5, 0, 0.5);
-        if (this.bot.entity.position.distanceSquared(walk) <= 0.25) return;
-        await this.bot.lookAt(walk);
-        this.bot.setControlState('forward', true);
-        let t = 0;
-        while (this.bot.entity.position.distanceSquared(walk) > 0.25 && t < 30) {
-            await this.bot.waitForTicks(1); t++;
+        const arrived = () => {
+            const pos = this.bot.entity.position;
+            return this.bot.entity.onGround === true && Math.abs(pos.y - floor.y) < 0.05 &&
+                Math.hypot(pos.x - walk.x, pos.z - walk.z) < 0.18;
+        };
+        try {
+            for (let t = 0; t < 40; t++) {
+                if (arrived()) {
+                    this.bot.trail?.record(this.bot.entity.position, false);
+                    return;
+                }
+                if (this.bot.isInCombat?.()) return;
+                const pos = this.bot.entity.position;
+                // Viser horizontalement et rester centre, meme si un autre systeme
+                // a fait pivoter le regard pendant la descente.
+                await this.bot.lookAt(new Vec3(walk.x, pos.y + 1.6, walk.z));
+                const centered = Math.hypot(pos.x - walk.x, pos.z - walk.z) < 0.18;
+                this.bot.setControlState('forward', !centered);
+                await this.bot.waitForTicks(1);
+            }
+            this.fail('Marche non atteinte : descente interrompue pour proteger l escalier');
+        } finally {
+            this.bot.setControlState('forward', false);
         }
-        this.bot.setControlState('forward', false);
     }
 
     // Tourne de 90 degres (nouvelle direction verrouillee). Echoue apres 4 essais

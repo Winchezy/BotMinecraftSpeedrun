@@ -1,7 +1,7 @@
 const Task = require('../lib/Task');
 const { protectedBlocks } = require('../lib/Survival');
-
-const failedBlockPositions = new Map(); // Key: "x,y,z", Value: fail count
+const { threatNearPath, threatNearPoint } = require('../lib/MobSafety');
+const { planCompletePath, existingPassageMovements, withTimeout } = require('../lib/Pathing');
 
 // Global underwater retry counter (resets only when task completes or bot reaches surface)
 let underwaterRetries = 0;
@@ -16,9 +16,11 @@ class MineBlock extends Task {
         this.retries = 0; // Track failed attempts
         this.maxRetries = 3;
         this.maxBlockFailures = 3; // Skip block after 3 failures
+        this.failedBlocks = bot.miningFailures ||= new Map();
     }
 
     async run() {
+        if (this.bot.isInCombat?.()) return;
         // Check if we're stuck underwater - abort and go to surface
         const pos = this.bot.entity.position;
         const feetBlock = this.bot.blockAt(pos.floored());
@@ -78,6 +80,7 @@ class MineBlock extends Task {
         const botPos = this.bot.entity.position.floored();
         const blockUnderFeet = botPos.offset(0, -1, 0);
         const blockAboveHead = botPos.offset(0, 2, 0);
+        let mobBlocked = false;
 
         for (const pos of candidates) {
             // Check 0a: PROTECTED BLOCKS - Skip water blockers
@@ -87,12 +90,20 @@ class MineBlock extends Task {
             }
 
             // Check 0b: BLACKLIST - Skip blocks that failed too many times
-            if (failedBlockPositions.has(posKey) && failedBlockPositions.get(posKey) >= this.maxBlockFailures) {
+            if (this.blockDeferred(pos)) {
                 continue; // Skip this block
             }
 
             // Check 1: Under feet validation
             if (pos.equals(blockUnderFeet) || pos.equals(blockAboveHead) || pos.equals(botPos)) continue;
+            // Reject overhead ore before selection, avoiding repeated unsafe targets.
+            if (pos.y > botPos.y) continue;
+            // Meme rayon que la retraite de Survival (+3 = distance de minage) : sinon le
+            // bot s'approche, Survival le fait fuir, puis il revient -> oscillation.
+            if (threatNearPoint(this.bot, pos, 3)) {
+                mobBlocked = true;
+                continue;
+            }
 
             // Check 2: WATER PROXIMITY CHECK (only direct neighbors)
             let nearWater = false;
@@ -111,12 +122,31 @@ class MineBlock extends Task {
             }
             if (nearWater) continue;
 
+            // A reachable ore is useless if its path crosses a mob pack.
+            const { goals } = require('mineflayer-pathfinder');
+            const route = this.bot.pathfinder.getPathTo(
+                this.bot.pathfinder.movements,
+                new goals.GoalNear(pos.x, pos.y, pos.z, 3), 100
+            );
+            if (route.status !== 'success') {
+                this.deferBlock(pos, 'Aucun trajet complet');
+                continue;
+            }
+            if (threatNearPath(this.bot, route.path)) {
+                mobBlocked = true;
+                continue;
+            }
+
             // Valid block found
             block = this.bot.blockAt(pos);
             break;
         }
 
         if (!block) {
+            if (mobBlocked) {
+                this.fail('Mobs sur le trajet du minerai');
+                return;
+            }
             this.retries++;
             console.log(`[${this.name}] Candidates found but filtered out (SeaLevel/Safety). Retry ${this.retries}/${this.maxRetries}`);
 
@@ -192,14 +222,22 @@ class MineBlock extends Task {
                     const sidePos = block.position.offset(1, 1, 0); // Up and side
                     // Check if sidePos is safe?
                     // Just use pathfinder to go near it but NOT on it.
-                    await this.bot.pathfinder.goto(new goals.GoalNear(block.position.x, this.bot.entity.position.y, block.position.z, 2.5));
+                    const sideGoal = new goals.GoalNear(block.position.x, this.bot.entity.position.y, block.position.z, 2.5);
+                    if (!await this.useExistingPassage(sideGoal)) await this.bot.pathfinder.goto(sideGoal);
                 } else {
-                    await this.bot.pathfinder.goto(goal);
+                    if (!await this.useExistingPassage(goal)) await this.bot.pathfinder.goto(goal);
                 }
             } catch (e) {
+                if (e.code === 'ACTION_INTERRUPTED') throw e;
                 console.log(`[${this.name}] Pathfind error: ${e.message}`);
+                // Compter l'echec sur ce bloc : sans ca, un trajet coupe a chaque fois
+                // (retraite Survival...) reciblait le meme minerai indefiniment.
+                this.deferBlock(block.position, e.message);
+                return;
             }
         }
+
+        if (this.bot.isInCombat?.()) return;
 
         // Re-check after moving - bot position may have changed
         const newBotPos = this.bot.entity.position.floored();
@@ -212,14 +250,14 @@ class MineBlock extends Task {
         // Equip Tool
         await this.equipBestTool(block);
 
-        try {
-            // Race collect with timeout (increased to 30s)
-            const collectPromise = this.bot.collectBlock.collect(block);
-            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 30000));
+        if (this.bot.isInCombat?.()) return;
 
-            await Promise.race([collectPromise, timeoutPromise]);
-            console.log(`[${this.name}] Collect finished.`);
+        try {
+            await this.collectAndVerify(block);
         } catch (err) {
+            if (err.code === 'ACTION_INTERRUPTED') throw err;
+            if (this.bot.collectBlock.cancelTask)
+                await withTimeout(this.bot, this.bot.collectBlock.cancelTask(), 2000, 'Annulation collecte trop longue');
             console.log(`[${this.name}] Dig error: ${err.message}`);
 
             // Increment retry counter
@@ -237,13 +275,40 @@ class MineBlock extends Task {
             }
 
             // Add block to blacklist
-            const posKey = `${block.position.x},${block.position.y},${block.position.z}`;
-            const currentFails = failedBlockPositions.get(posKey) || 0;
-            failedBlockPositions.set(posKey, currentFails + 1);
-            console.log(`[${this.name}] Block at ${posKey} failed ${currentFails + 1} times (local: ${this.retries}, underwater: ${underwaterRetries})`);
-
-            await this.wander();
+            this.deferBlock(block.position, err.message);
+            // Le prochain tick essaie un autre candidat avant de relocaliser.
         }
+    }
+
+    failureKey(position) {
+        return `${this.bot.game?.dimension || 'overworld'}:${this.blockName}:${position.x},${position.y},${position.z}`;
+    }
+
+    blockDeferred(position, now = Date.now()) {
+        const key = this.failureKey(position), failure = this.failedBlocks.get(key);
+        if (!failure) return false;
+        if (now >= failure.until) { this.failedBlocks.delete(key); return false; }
+        return true;
+    }
+
+    deferBlock(position, reason, now = Date.now()) {
+        for (const [key, value] of this.failedBlocks) if (value.until <= now) this.failedBlocks.delete(key);
+        const key = this.failureKey(position);
+        this.failedBlocks.set(key, { until: now + 60000, reason });
+        console.log(`[${this.name}] Cible ${position} ecartee pendant 60 s : ${reason}`);
+    }
+
+    async collectAndVerify(block) {
+        const before = this.countCollected();
+        await withTimeout(this.bot, this.bot.collectBlock.collect(block), 30000, 'Collecte trop longue');
+        // L'inventaire peut arriver apres la fin du plugin de collecte.
+        for (let i = 0; i < 5 && this.countCollected() <= before; i++) await this.bot.waitForTicks(2);
+        const gained = this.countCollected() - before;
+        if (gained <= 0) throw new Error('Bloc mine mais aucun objet attendu recupere');
+        this.failedBlocks.delete(this.failureKey(block.position));
+        console.log(`[${this.name}] Recolte confirmee dans l inventaire : +${gained}`);
+        if (this.countCollected() >= this.count) this.complete();
+        return gained;
     }
 
     // Compte les objets de l'inventaire qui valident l'objectif de minage.
@@ -328,6 +393,22 @@ class MineBlock extends Task {
             }
         } catch (e) {
             console.log(`[${this.name}] Staircase error: ${e.message}`);
+        }
+    }
+
+    async useExistingPassage(goal) {
+        const original = this.bot.pathfinder.movements;
+        const walking = existingPassageMovements(this.bot);
+        const route = await planCompletePath(this.bot, goal, 1500, walking);
+        if (route.status !== 'success' || threatNearPath(this.bot, route.path) || this.bot.isInCombat?.()) return false;
+        console.log(`[${this.name}] Reutilisation d'un passage ouvert, sans creuser.`);
+        this.bot.chat?.('[SpeedBot] Je rejoins le filon par un passage deja ouvert.');
+        this.bot.pathfinder.setMovements(walking);
+        try {
+            await withTimeout(this.bot, this.bot.pathfinder.goto(goal), 20000, 'Passage bloque');
+            return true;
+        } finally {
+            if (this.bot.pathfinder.movements === walking) this.bot.pathfinder.setMovements(original);
         }
     }
 

@@ -1,5 +1,8 @@
 const Task = require('../lib/Task');
 const { goals } = require('mineflayer-pathfinder');
+const { threatNearPoint, threatNearPath } = require('../lib/MobSafety');
+const { planCompletePath, withTimeout } = require('../lib/Pathing');
+const { getFuelSmeltOutput } = require('../lib/ResourceAmounts');
 
 class SmeltTask extends Task {
     constructor(bot, inputItem, outputItem, count = 1) {
@@ -22,42 +25,63 @@ class SmeltTask extends Task {
         }
 
         // Find or place furnace
-        let furnace = this.bot.findBlock({
-            matching: this.mcData.blocksByName.furnace.id,
-            maxDistance: 32
-        });
+        let furnace = null;
+        if (this.bot.isInCombat?.()) return;
+        const positions = this.bot.findBlocks({ matching: this.mcData.blocksByName.furnace.id, maxDistance: 32, count: 16 });
+        for (const pos of positions) {
+            if (threatNearPoint(this.bot, pos, 4)) continue;
+            const route = await planCompletePath(this.bot, new goals.GoalNear(pos.x, pos.y, pos.z, 2));
+            if (route.status === 'success' && !threatNearPath(this.bot, route.path)) {
+                furnace = this.bot.blockAt(pos);
+                break;
+            }
+        }
 
         if (!furnace) {
+            await require('../lib/Workstations')(this.bot).recover('furnace');
             // Check if we have a furnace in inventory
             const furnaceItem = this.bot.inventory.items().find(i => i.name === 'furnace');
             if (furnaceItem) {
-                await this.placeFurnace(furnaceItem);
-                furnace = this.bot.findBlock({
-                    matching: this.mcData.blocksByName.furnace.id,
-                    maxDistance: 10
-                });
+                if (threatNearPoint(this.bot, this.bot.entity.position, 4) && !await this.relocateWorkstation()) {
+                    this.fail('Mobs sur le trajet du four');
+                    return;
+                }
+                furnace = await this.placeFurnace(furnaceItem);
             } else {
                 console.log(`[${this.name}] No furnace available, need to craft one`);
-                this.fail("No furnace");
+                this.fail(positions.length ? 'Mobs sur le trajet du four' : 'No furnace');
                 return;
             }
         }
 
         if (!furnace) {
-            this.fail("Could not place furnace");
+            if (!this.hasFailed) this.fail("Could not place furnace");
             return;
         }
 
         // Move close to furnace
         if (this.bot.entity.position.distanceTo(furnace.position) > 3) {
-            await this.bot.pathfinder.goto(new goals.GoalNear(
+            await withTimeout(this.bot, this.bot.pathfinder.goto(new goals.GoalNear(
                 furnace.position.x, furnace.position.y, furnace.position.z, 2
-            ));
+            )), 15000, 'Trajet du four trop long');
+        }
+
+        if (threatNearPoint(this.bot, furnace.position, 4) || this.bot.isInCombat?.()) {
+            this.fail('Mobs sur le trajet du four');
+            return;
         }
 
         // Open furnace
         console.log(`[${this.name}] Opening furnace at ${furnace.position}`);
         const furnaceBlock = await this.bot.openFurnace(furnace);
+        try {
+        // Recuperer le resultat deja disponible meme sans combustible en poche.
+        if (furnaceBlock.outputItem()?.name === this.outputItem) {
+            await furnaceBlock.takeOutput();
+            const ready = this.bot.inventory.items().filter(i => i.name === this.outputItem)
+                .reduce((n, i) => n + i.count, 0);
+            if (ready >= this.count) { this.complete(); return; }
+        }
 
         // Add fuel if needed
         if (!furnaceBlock.fuelItem()) {
@@ -86,13 +110,17 @@ class SmeltTask extends Task {
             if (fuel) {
                 console.log(`[${this.name}] Adding fuel: ${fuel.name}`);
                 try {
-                    await furnaceBlock.putFuel(fuel.type, null, (fuel.name.includes('pickaxe') || fuel.name.includes('sword')) ? 1 : Math.min(fuel.count, 8));
+                    const pending = furnaceBlock.inputItem();
+                    const carried = items.filter(i => i.name === this.inputItem).reduce((n,i) => n+i.count,0);
+                    const remaining = Math.min(this.count - outputCount, carried + (pending?.name === this.inputItem ? pending.count : 0));
+                    const capacity = getFuelSmeltOutput(fuel.name);
+                    if (remaining > 0 && capacity > 0)
+                        await furnaceBlock.putFuel(fuel.type, null, Math.min(fuel.count, Math.ceil(remaining / capacity)));
                 } catch (err) {
                     console.log(`[${this.name}] Failed to put fuel: ${err.message}`);
                 }
             } else {
                 console.log(`[${this.name}] No fuel available in inventory.`);
-                furnaceBlock.close();
                 this.fail("No fuel available");
                 return;
             }
@@ -117,14 +145,20 @@ class SmeltTask extends Task {
 
         // Monitor smelting
         console.log(`[${this.name}] Monitoring smelting...`);
-        const maxTicks = 200; // 10 seconds per cycle
+        const maxTicks = Math.min(1200, Math.max(240, this.count * 240));
         let ticks = 0;
 
         while (ticks < maxTicks) {
             await this.bot.waitForTicks(20);
             ticks += 20;
 
-            if (furnaceBlock.outputItem()) {
+            if (threatNearPoint(this.bot, furnace.position, 4) || this.bot.isInCombat?.() ||
+                this.bot.entity.position.distanceTo(furnace.position) > 4) {
+                this.fail('Mobs sur le trajet du four');
+                return;
+            }
+
+            if (furnaceBlock.outputItem()?.name === this.outputItem) {
                 console.log(`[${this.name}] Taking output: ${furnaceBlock.outputItem().name}`);
                 await furnaceBlock.takeOutput();
                 collectedAny = true;
@@ -146,8 +180,6 @@ class SmeltTask extends Task {
             }
         }
 
-        furnaceBlock.close();
-
         // Rien ajoute ni collecte et toujours pas assez : le four est vide et on n'a pas
         // de matiere premiere -> echec EXPLICITE pour que l'Agent aille miner, au lieu de
         // relancer Smelt a vide indefiniment.
@@ -156,6 +188,10 @@ class SmeltTask extends Task {
             .reduce((a, b) => a + b.count, 0);
         if (finalOut < this.count && !addedInput && !collectedAny) {
             this.fail("Rien a fondre (four vide, pas de matiere premiere)");
+        }
+        if (finalOut >= this.count) this.complete();
+        } finally {
+            furnaceBlock.close();
         }
     }
 
@@ -166,6 +202,10 @@ class SmeltTask extends Task {
         // Blocs occupes par le bot lui-meme : on ne peut pas poser le fourneau dedans.
         const feetPos = this.bot.entity.position.floored();
         const headPos = feetPos.offset(0, 1, 0);
+        if (threatNearPoint(this.bot, feetPos, 4) || this.bot.isInCombat?.()) {
+            this.fail('Mobs sur le trajet du four');
+            return null;
+        }
 
         const nearby = this.bot.findBlocks({
             matching: b => b.type !== this.mcData.blocksByName.air.id &&
@@ -182,6 +222,10 @@ class SmeltTask extends Task {
         for (const pos of nearby) {
             const above = pos.offset(0, 1, 0);
             const blockAbove = this.bot.blockAt(above);
+            if (Math.abs(above.y - feetPos.y) > 1 || threatNearPoint(this.bot, above, 4)) continue;
+            // Le bot doit pouvoir rester sur un sol stable pour acceder au four.
+            const floor = this.bot.blockAt(feetPos.offset(0, -1, 0));
+            if (floor?.boundingBox !== 'block' || /lava|magma|fire/.test(floor.name)) continue;
 
             // L'espace au-dessus doit etre vide...
             if (!blockAbove || blockAbove.type !== this.mcData.blocksByName.air.id) continue;
@@ -196,14 +240,37 @@ class SmeltTask extends Task {
                 await this.bot.equip(furnaceItem, 'hand');
                 await this.bot.lookAt(pos.offset(0.5, 1, 0.5), false);
                 await this.bot.placeBlock(this.bot.blockAt(pos), new Vec3(0, 1, 0));
+                require('../lib/Workstations')(this.bot).remember('furnace',above);
                 console.log(`[SmeltTask] Furnace placed successfully.`);
-                return;
+                this.bot.chat?.('[SpeedBot] Four pose dans une zone verifiee, sans mobs proches.');
+                return this.bot.blockAt(above);
             } catch (err) {
                 console.log(`[SmeltTask] Failed to place furnace at ${above}: ${err.message}`);
                 // Continue to next spot
             }
         }
         throw new Error("Could not find a valid spot to place furnace");
+    }
+
+    async relocateWorkstation() {
+        const positions = this.bot.findBlocks({
+            matching: ['grass_block', 'dirt', 'stone', 'cobblestone'].map(n => this.mcData.blocksByName[n].id),
+            maxDistance: 32, count: 100,
+            useExtraInfo: block => !!block?.position &&
+                this.bot.blockAt(block.position.offset(0, 1, 0))?.boundingBox === 'empty' &&
+                this.bot.blockAt(block.position.offset(0, 2, 0))?.boundingBox === 'empty'
+        });
+        for (const floor of positions) {
+            const target = floor.offset(0, 1, 0);
+            if (threatNearPoint(this.bot, target, 6)) continue;
+            const goal = new goals.GoalNear(target.x, target.y, target.z, 1);
+            const route = await planCompletePath(this.bot, goal);
+            if (route.status !== 'success' || threatNearPath(this.bot, route.path) || this.bot.isInCombat?.()) continue;
+            this.bot.chat?.('[SpeedBot] Je cherche un emplacement sur pour le four.');
+            await withTimeout(this.bot, this.bot.pathfinder.goto(goal), 15000, 'Emplacement du four inaccessible');
+            return !threatNearPoint(this.bot, this.bot.entity.position, 4);
+        }
+        return false;
     }
 }
 

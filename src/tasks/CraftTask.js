@@ -1,22 +1,47 @@
 const Task = require('../lib/Task');
+const { goals } = require('mineflayer-pathfinder');
+const { planCompletePath, withTimeout } = require('../lib/Pathing');
+const { threatNearPoint, threatNearPath } = require('../lib/MobSafety');
+const { craftBatch } = require('../lib/ResourceAmounts');
+
+function usableTable(bot, block) {
+    return !!block?.position && !threatNearPoint(bot, block.position, 3) &&
+        (bot.unusableTables?.get(block.position.toString()) || 0) < Date.now();
+}
 
 class CraftTask extends Task {
-    constructor(bot, itemName, count = 1) {
+    constructor(bot, itemName, count = 1, dependencyChain = []) {
         super(bot);
         this.name = `Craft_${itemName}`;
         this.itemName = itemName;
         this.count = count;
+        this.dependencyChain = [...dependencyChain, itemName];
         this.mcData = require('minecraft-data')(bot.version);
     }
 
     async run() {
         console.log(`[DEBUG] CraftTask running for ${this.itemName}`);
-        const item = this.bot.inventory.items().find(i => i.name === this.itemName);
-        if (item && item.count >= this.count) {
+        // Somme sur toutes les piles : les outils ne s'empilent pas (1 par slot).
+        const owned = this.bot.inventory.items()
+            .filter(i => i.name === this.itemName)
+            .reduce((acc, i) => acc + i.count, 0);
+        if (owned >= this.count) {
             this.complete();
             return;
         }
 
+        if (this.dependencyTask) {
+            const child = this.dependencyTask;
+            if (!child.isDone()) await child.run();
+            if (child.isDone()) {
+                this.dependencyTask = null;
+                if (child.hasFailed) this.fail(`Preparation ${child.name} impossible : ${child.failureReason}`);
+            }
+            return;
+        }
+
+        if (['crafting_table','furnace'].includes(this.itemName) &&
+            await require('../lib/Workstations')(this.bot).recover(this.itemName)) {this.complete();return;}
         const targetId = this.mcData.itemsByName[this.itemName]?.id;
         if (!targetId) {
             this.fail(`Unknown item ${this.itemName}`);
@@ -28,6 +53,14 @@ class CraftTask extends Task {
         const isStick = this.itemName === 'stick';
         const recipesNoTable = this.bot.recipesFor(targetId, null, 1, null);
 
+        if (!recipesNoTable.length && !this.bot.recipesFor(targetId, null, 1, true).length) {
+            try {
+                this.dependencyTask = require('../lib/CraftDependencies').nextDependency(this.bot,this.itemName,this.dependencyChain);
+                if (!this.dependencyTask) { this.fail('Recette indisponible pour '+this.itemName); return; }
+                this.bot.chat?.(`[SpeedBot] Pour fabriquer ${this.itemName}, je prepare ${this.dependencyTask.name}.`);
+            } catch (error) { this.fail(error.message); }
+            return;
+        }
         if (recipesNoTable.length > 0 || isStick) {
             console.log(`[CraftTask] Crafting ${this.itemName} using inventory (no table needed).`);
             try {
@@ -42,7 +75,9 @@ class CraftTask extends Task {
                 }
 
                 if (recipesNoTable.length > 0) {
-                    await this.bot.craft(recipesNoTable[0], 1, null);
+                    const batches = craftBatch(this.bot, recipesNoTable[0], this.count - owned);
+                    if (!batches) { this.fail('Missing ingredients for ' + this.itemName); return; }
+                    await this.bot.craft(recipesNoTable[0], batches, null);
                     console.log(`Crafted ${this.itemName}`);
                     return;
                 } else if (isStick) {
@@ -56,43 +91,64 @@ class CraftTask extends Task {
         }
 
         // 2. Need Table
-        let table = this.bot.findBlock({ matching: this.mcData.blocksByName.crafting_table.id, maxDistance: 32 });
+        let table = this.bot.findBlock({ matching: this.mcData.blocksByName.crafting_table.id,
+            useExtraInfo: block => usableTable(this.bot, block), maxDistance: 4 });
+        if (!table && !this.bot.inventory.items().some(i=>i.name==='crafting_table'))
+            await require('../lib/Workstations')(this.bot).recover('crafting_table');
+        const tableItem = this.bot.inventory.items().find(i => i.name === 'crafting_table');
 
-        // If we don't have a table placed, check if we have one to place
-        if (!table) {
-            const tableItem = this.bot.inventory.items().find(i => i.name === 'crafting_table');
-            if (tableItem) {
-                console.log("[CraftTask] Placing required crafting table...");
-                await this.placeTable(tableItem);
-                table = this.bot.findBlock({ matching: this.mcData.blocksByName.crafting_table.id, maxDistance: 4 });
-            }
+        // An owned table can be placed nearby instead of climbing to a distant one.
+        if (!table && tableItem) {
+            console.log("[CraftTask] Placing required crafting table nearby...");
+            await this.placeTable(tableItem);
+            table = this.bot.findBlock({ matching: this.mcData.blocksByName.crafting_table.id, maxDistance: 4 });
+        }
+
+        if (!table && !tableItem) {
+            table = this.bot.findBlock({ matching: this.mcData.blocksByName.crafting_table.id,
+                useExtraInfo: block => usableTable(this.bot, block), maxDistance: 32 });
         }
 
         if (!table) {
-            this.fail("Table required/not found for " + this.itemName);
+            if (!tableItem && this.itemName !== 'crafting_table')
+                this.dependencyTask = new CraftTask(this.bot,'crafting_table',1,this.dependencyChain);
+            else this.fail("Table required/not found for " + this.itemName);
             return;
         }
 
         // Go to table
-        if (this.bot.entity.position.distanceTo(table.position) > 3) {
+        if (this.bot.entity.position.distanceTo(table.position) > 3 || !this.bot.canSeeBlock(table)) {
             console.log(`[CraftTask] Walking to table at ${table.position}...`);
-            const { goals } = require('mineflayer-pathfinder');
             try {
-                await this.bot.pathfinder.goto(new goals.GoalNear(table.position.x, table.position.y, table.position.z, 2));
+                const goal = new goals.GoalLookAtBlock(table.position, this.bot.world, { reach: 3 });
+                const route = await planCompletePath(this.bot, goal);
+                if (route.status !== 'success' || threatNearPath(this.bot, route.path)) throw new Error('Aucun acces sur a la table');
+                await withTimeout(this.bot, this.bot.pathfinder.goto(goal), 15000, 'Acces a la table trop long');
             } catch (e) {
+                this.rejectTable(table);
                 this.fail(`Path to table failed: ${e.message}`);
                 return;
             }
+        }
+
+        if (!this.bot.canSeeBlock(table) || this.bot.entity.position.distanceTo(table.position) > 4 ||
+            threatNearPoint(this.bot, table.position, 3) || this.bot.isInCombat?.()) {
+            this.rejectTable(table);
+            this.fail('Table inaccessible pour fabriquer ' + this.itemName);
+            return;
         }
 
         // Craft with table
         const recipesTable = this.bot.recipesFor(targetId, null, 1, table);
         if (recipesTable.length > 0) {
             try {
-                await this.bot.craft(recipesTable[0], 1, table);
+                const batches = craftBatch(this.bot, recipesTable[0], this.count - owned);
+                if (!batches) { this.fail('Missing ingredients for ' + this.itemName); return; }
+                await this.bot.craft(recipesTable[0], batches, table);
                 console.log(`Crafted ${this.itemName} using table`);
                 return;
             } catch (e) {
+                this.rejectTable(table);
                 this.fail(`Table craft failed: ${e.message}`);
             }
         } else {
@@ -106,9 +162,16 @@ class CraftTask extends Task {
         }
     }
 
+    rejectTable(table) {
+        this.bot.unusableTables ||= new Map();
+        this.bot.unusableTables.set(table.position.toString(), Date.now() + 120000);
+        this.bot.chat?.('[SpeedBot] Table inaccessible : je prepare une table a proximite.');
+    }
+
     async placeTable(tableItem) {
         const { Vec3 } = require('vec3');
         const botPos = this.bot.entity.position.floored();
+        if (threatNearPoint(this.bot, botPos, 3) || this.bot.isInCombat?.()) return;
 
         // Strategy 1: Find existing open spot
         // Try to place on the block right in front/side of us
@@ -124,7 +187,8 @@ class CraftTask extends Task {
             const blockAbove = this.bot.blockAt(above);
 
             // Should be air (or explicit transparent), and not where we are standing
-            if (blockAbove && blockAbove.boundingBox !== 'block') {
+            if (blockAbove && blockAbove.name === 'air' && Math.abs(above.y - botPos.y) <= 1 &&
+                !/lava|magma|fire/.test(this.bot.blockAt(pos)?.name || '') && !threatNearPoint(this.bot, above, 3)) {
                 // Check if it's the bot's position (Head or Feet)
                 if (above.equals(botPos)) continue; // Feet
                 if (above.equals(botPos.offset(0, 1, 0))) continue; // Head
@@ -138,6 +202,7 @@ class CraftTask extends Task {
                         console.log(`[CraftTask] Placing table at ${above}`);
                         await this.bot.equip(tableItem, 'hand');
                         await this.bot.placeBlock(this.bot.blockAt(pos), new Vec3(0, 1, 0));
+                        require('../lib/Workstations')(this.bot).remember('crafting_table',above);
                         await this.bot.waitForTicks(10);
                         return;
                     } catch (e) {
@@ -165,7 +230,12 @@ class CraftTask extends Task {
             const block = this.bot.blockAt(targetPos);
 
             // It must be a solid block to dig
-            if (block && block.boundingBox === 'block') {
+            if (block && ['stone', 'dirt', 'cobblestone', 'deepslate', 'tuff', 'andesite', 'diorite', 'granite'].includes(block.name) &&
+                this.bot.blockAt(targetPos.offset(0, -1, 0))?.boundingBox === 'block' &&
+                [new Vec3(1,0,0), new Vec3(-1,0,0), new Vec3(0,1,0), new Vec3(0,0,1), new Vec3(0,0,-1)].every(delta => {
+                    const neighbor = this.bot.blockAt(targetPos.plus(delta));
+                    return neighbor && !/water|lava|gravel|sand/.test(neighbor.name);
+                })) {
                 // Ensure it is not the block under us (shouldn't be, off.y >= 0)
                 // Dig it
                 try {
@@ -183,6 +253,7 @@ class CraftTask extends Task {
                         console.log(`[CraftTask] Placing table in created spot at ${targetPos}`);
                         await this.bot.equip(tableItem, 'hand');
                         await this.bot.placeBlock(blockBelow, new Vec3(0, 1, 0));
+                        require('../lib/Workstations')(this.bot).remember('crafting_table',targetPos);
                         await this.bot.waitForTicks(10);
                         return;
                     } else {
@@ -201,3 +272,4 @@ class CraftTask extends Task {
 }
 
 module.exports = CraftTask;
+module.exports.usableTable = usableTable;

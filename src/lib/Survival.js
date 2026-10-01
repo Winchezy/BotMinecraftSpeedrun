@@ -2,6 +2,11 @@
 
 const { Vec3 } = require('vec3');
 const { goals } = require('mineflayer-pathfinder');
+const { disableDiagonalMoves, findBlockingStep, findCardinalWaypoint, existingPassageMovements } = require('./Pathing');
+const { isHostileMob, isNeutralMob, decideResponse, MobAwareness } = require('./MobThreats');
+const { routeThreats, threatNearPath, hasMobAccess } = require('./MobSafety');
+const { equipDefense, guardWithShield } = require('./Defense');
+const { constrainCombat } = require('./SurvivalPolicy');
 
 // Last safe position tracking (Module Scope)
 let lastSafePosition = null;
@@ -11,6 +16,10 @@ let lastSafePositionTime = Date.now();
 const protectedBlocks = new Set(); // Store as "x,y,z" strings
 
 function setupSurvival(bot) {
+    const tactics = new (require('./CombatTactics'))(bot);
+    const awareness = new MobAwareness(bot);
+    bot.mobAwareness = awareness;
+    let lastAwarenessChat = 0;
     const mcData = require('minecraft-data')(bot.version);
     // Remove local declarations
 
@@ -55,219 +64,318 @@ function setupSurvival(bot) {
         });
     });
 
-    // Health monitoring with auto-eat
-    bot.on('health', async () => {
+    // GetFood gere seul les repas et la cuisson, sans consommation concurrente.
+    bot.on('health', () => {
         if (bot.health < 5) {
             console.log(`[Survival] Low health: ${bot.health}/20`);
 
-            // Try to eat food
-            const food = bot.inventory.items().find(item =>
-                item.name.includes('flesh') ||
-                item.name.includes('beef') ||
-                item.name.includes('pork') ||
-                item.name.includes('bread') ||
-                item.name.includes('apple') ||
-                item.name.includes('carrot') ||
-                item.name.includes('potato')
-            );
-
-            if (food) {
-                try {
-                    console.log(`[Survival] EMERGENCY: Eating ${food.name}!`);
-                    await bot.equip(food, 'hand');
-                    bot.activateItem();
-                    await bot.waitForTicks(32); // Wait for eating
-                    bot.deactivateItem();
-                } catch (e) {
-                    console.log(`[Survival] Failed to eat: ${e.message}`);
-                }
-            }
         }
         if (bot.food < 5) {
             console.log(`[Survival] Hungry: ${bot.food}/20`);
         }
     });
 
-    // Combat defense system - fight back when attacked
-    const hostileMobs = [
-        'zombie', 'skeleton', 'spider', 'creeper', 'enderman',
-        'witch', 'slime', 'phantom', 'drowned', 'husk', 'stray',
-        'zombie_villager', 'pillager', 'vindicator', 'ravager',
-        'blaze', 'ghast', 'magma_cube', 'hoglin', 'piglin_brute',
-        'warden', 'wither_skeleton'
-    ];
-
-    let isInCombat = false;
+    // Only attack normally hostile mobs at close range. Neutral mobs are never
+    // attacked by the survival system, even after ambiguous damage events.
+    let combatMode = null; // 'fight' or 'retreat'
     let combatTarget = null;
+    let combatLease = null;
+    let lastDamageTime = 0;
+    let lastRetreatTime = 0;
+    let checkingThreat = false;
+    let urgentPending = false;
+    let retreatStall = null;
+    bot.on('death', () => {
+        tactics.reset();
+        if (combatMode === 'fight') bot.pvp.stop();
+        combatMode = null;
+        combatTarget = null;
+        retreatStall = null;
+        bot.shieldStoppedChase = false;
+        bot.deactivateItem();
+    });
 
     // React to damage (e.g. being shot by skeleton)
-    bot.on('entityHurt', (entity) => {
+    bot.on('entityHurt', (entity, source) => {
         if (entity !== bot.entity) return;
-
-        // Find what hurt us (if possible, usually we check nearby mobs)
-        // Mineflayer doesn't always tell us the attacker in this event directly easily,
-        // but we can scan for nearby mobs that are aggro'd.
-        // Actually for projectiles, it's harder.
-        // Let's just trigger a scan with high urgency.
+        if (bot.food===0 && !source) {
+            bot.lastStarvationDamage = Date.now();
+            console.log('[Survival] Degats sans attaquant identifie a faim nulle : priorite nourriture.');
+            // Ne pas attribuer automatiquement la famine aux mobs lointains.
+            // Les attaques identifiees et la surveillance reguliere restent actives.
+            return;
+        }
+        awareness.markAttack(source);
+        bot.threatRevision = (bot.threatRevision || 0) + 1;
+        lastDamageTime = Date.now();
         console.log('[Survival] Ouch! Took damage. Scanning for threats...');
         checkForThreats(true);
     });
 
-    // Check for hostile mobs targeting the bot
     let lastThreatCheck = 0;
-    const checkForThreats = async (urgent = false) => {
-        // Throttle: max once per 3 seconds (unless urgent damage)
-        const now = Date.now();
-        if (!urgent && (now - lastThreatCheck) < 3000) return;
-        lastThreatCheck = now;
+    const clearThreat = () => {
+        if (!combatMode) return;
+        if (bot.actions) {
+            if (bot.actions.valid(combatLease)) bot.actions.cancel('Menace terminee');
+            tactics.jumpTicks = 0;
+            tactics.dodgeTicks = 0;
+            combatMode = null;
+            combatTarget = null;
+            combatLease = null;
+            bot.shieldStoppedChase = false;
+            console.log('[Survival] Threat cleared. Resuming duties.');
+            return;
+        }
+        tactics.reset();
+        if (combatMode === 'fight') bot.pvp.stop();
+        if (combatMode === 'retreat') bot.pathfinder.stop();
+        combatMode = null;
+        combatTarget = null;
+        bot.shieldStoppedChase = false;
+        bot.deactivateItem();
+        console.log('[Survival] Threat cleared. Resuming duties.');
+    };
 
+    const checkForThreats = async (urgent = false) => {
+        const now = Date.now();
+        if (checkingThreat) { if (urgent) urgentPending = true; return; }
+        if (!urgent && now - lastThreatCheck < 200) return;
+        checkingThreat = true;
+        lastThreatCheck = now;
         try {
             if (!bot.entity) return;
-
-            // Scan for hostiles (debug logs removed)
-
-            // Find nearby hostile mobs - FIXED: removed broken type check
-            const nearbyHostile = bot.nearestEntity((entity) => {
-                if (!entity || !entity.name || entity === bot.entity) return false;
-
-                const isHostile = hostileMobs.some(h => entity.name.toLowerCase().includes(h));
-                if (!isHostile) return false;
-
-                const distance = bot.entity.position.distanceTo(entity.position);
-                // React to any hostile within 16 blocks
-                return distance < 16;
-            });
-
-            if (nearbyHostile) {
-                console.log(`[Survival] THREAT DETECTED: ${nearbyHostile.name} at distance ${bot.entity.position.distanceTo(nearbyHostile.position).toFixed(1)}`);
-                await handleThreat(bot, nearbyHostile, urgent);
-            } else {
-                if (isInCombat) {
-                    if (!combatTarget || !combatTarget.isValid || bot.entity.position.distanceTo(combatTarget.position) > 20) {
-                        isInCombat = false;
-                        combatTarget = null;
-                        bot.pvp.stop();
-                        bot.pathfinder.stop();
-                        console.log('[Survival] Combat threat cleared/lost. Resuming duties.');
-                        bot.chat("[Survival] Threat cleared.");
-                    } else {
-                        try { bot.pvp.attack(combatTarget); } catch (e) { }
+            const distanceTo = entity => bot.entity.position.distanceTo(entity.position);
+            const states = new Map();
+            for (const entity of Object.values(bot.entities)) {
+                if (!entity?.position || !(isHostileMob(entity) || isNeutralMob(entity)) || distanceTo(entity) > 32) continue;
+                const previous = awareness.observations.get(entity.id)?.state;
+                const observed = awareness.observe(entity, now);
+                states.set(entity.id, observed);
+                if (previous !== observed.state) {
+                    console.log(`[MobAwareness] ${entity.name}: ${observed.state}, ${observed.distance.toFixed(1)} blocs (${observed.evidence}).`);
+                    if (observed.state === 'hostile' && now - lastAwarenessChat > 3000) {
+                        lastAwarenessChat = now;
+                        const message = observed.evidence === 'poursuite probable' ?
+                            `Un ${entity.name} semble s'approcher de moi.` :
+                            observed.evidence === 'attaque recue' ?
+                                `Un ${entity.name} m'attaque.` :
+                                `Un ${entity.name} montre des signes d'agressivite.`;
+                        bot.chat(`[SpeedBot] ${message}`);
                     }
                 }
             }
+            awareness.prune(now);
+            const hostile = bot.nearestEntity(entity => isHostileMob(entity) && distanceTo(entity) < 18 &&
+                states.get(entity.id)?.state !== 'passive' &&
+                (now - lastDamageTime < 3000 || hasMobAccess(bot, bot.entity.position, entity)));
+            const recentlyHurt = now - lastDamageTime < 3000;
+            const neutral = bot.nearestEntity(entity => isNeutralMob(entity) && distanceTo(entity) < 18 &&
+                (states.get(entity.id)?.state === 'hostile' || recentlyHurt && distanceTo(entity) < 4) &&
+                hasMobAccess(bot, bot.entity.position, entity));
+            // A nearby neutral is a possible attacker after damage. Give it space,
+            // but never turn that uncertainty into an attack.
+            const attacker = Object.values(bot.entities).find(entity => entity?.position &&
+                distanceTo(entity) < 18 && (isHostileMob(entity) || isNeutralMob(entity)) &&
+                awareness.observations.get(entity.id)?.attackedAt != null &&
+                now - awareness.observations.get(entity.id).attackedAt < 10000);
+            const target = attacker || (hostile && distanceTo(hostile) < 5 ? hostile : (neutral || hostile));
+            const nearbyHostiles = Object.values(bot.entities).filter(entity =>
+                isHostileMob(entity) && states.get(entity.id)?.state === 'hostile' && distanceTo(entity) < 16 && hasMobAccess(bot, bot.entity.position, entity)
+            ).length;
+            const armed = bot.inventory.items().some(item => /_(sword|axe)$/.test(item.name));
+            let action = target ? decideResponse(target, {
+                distance: distanceTo(target), health: bot.health, armed,
+                nearbyHostiles, recentDamage: recentlyHurt, threatState: states.get(target.id)?.state
+            }) : 'ignore';
+            if (hostile && nearbyHostiles >= 2 && distanceTo(hostile) < 16) action = 'retreat';
+            if (target && bot.mobBlockedSince && now - bot.mobBlockedSince >= 30000 &&
+                now - (bot.lastMobBlock || 0) < 60000 &&
+                isHostileMob(target) && !['creeper', 'warden', 'ravager', 'piglin_brute', 'ghast'].includes(target.name) &&
+                bot.inventory.items().some(i => i.name.endsWith('_sword')) && bot.health >= 10 &&
+                nearbyHostiles < 2 && distanceTo(target) <= (target.name === 'blaze' ? 4 : 10) &&
+                states.get(target.id)?.state === 'hostile' && hasMobAccess(bot, bot.entity.position, target)) action = 'fight';
+            if (attacker) {
+                const gear = { shield: bot.inventory.items().some(i => i.name === 'shield'), weapon: armed };
+                if (gear.shield && gear.weapon && bot.health >= 7 && nearbyHostiles < 2 &&
+                    isHostileMob(attacker) && !['creeper', 'warden', 'ravager', 'piglin_brute', 'ghast'].includes(attacker.name) &&
+                    distanceTo(attacker) <= (attacker.name === 'blaze' ? 4 : 10) &&
+                    hasMobAccess(bot, bot.entity.position, attacker)) action = 'fight';
+            }
+
+            if (action === 'retreat') {
+                if (!retreatStall || now - retreatStall.lastSeen > 10000 || retreatStall.target !== target.id ||
+                    bot.entity.position.distanceTo(retreatStall.position) >= 1) {
+                    retreatStall = { target: target.id, position: bot.entity.position.clone(), since: now, lastSeen: now };
+                }
+                retreatStall.lastSeen = now;
+                if (require('./MobThreats').shouldFightStalemate(target, {
+                    stuckMs: now - retreatStall.since, distance: distanceTo(target), health: bot.health,
+                    sword: bot.inventory.items().some(i => i.name.endsWith('_sword')),
+                    nearbyHostiles, threatState: states.get(target.id)?.state
+                }) && hasMobAccess(bot, bot.entity.position, target)) {
+                    if (combatMode !== 'fight' || combatTarget !== target) {
+                        console.log(`[Survival] Fuite bloquee depuis 30 s : defense contre ${target.name}.`);
+                    }
+                    action = 'fight';
+                }
+            }
+
+            action = constrainCombat(bot, action);
+            if (action === 'ignore') {
+                clearThreat();
+                return;
+            }
+            if (bot.actions) {
+                const previous = combatLease;
+                combatLease = bot.actions.acquire('combat', 80);
+                if (!combatLease) return;
+                if (previous !== combatLease) { combatMode = null; combatTarget = null; }
+            }
+            const respond = async () => {
+            if (attacker) {
+                const gear = await equipDefense(bot);
+                if (gear.shield) {
+                    await bot.lookAt(attacker.position.offset(0, 1, 0), true);
+                    if (combatMode !== 'fight') bot.activateItem(true);
+                }
+            }
+            if (action === 'retreat') {
+                await equipDefense(bot);
+                if (combatMode === 'fight') bot.pvp.stop();
+                if (combatMode !== 'retreat' || combatTarget !== target) {
+                    console.log(`[Survival] Avoiding ${target.name} at ${distanceTo(target).toFixed(1)} blocks.`);
+                }
+                combatMode = 'retreat';
+                combatTarget = target;
+                if (now - lastRetreatTime > 2500) {
+                    lastRetreatTime = now;
+                    await retreat(bot, target);
+                }
+                return;
+            }
+            if (combatMode === 'fight' && combatTarget === target) {
+                await equipDefense(bot);
+                return;
+            }
+            if (combatMode === 'retreat') bot.pathfinder.stop();
+            await equipDefense(bot);
+            bot.pathfinder.stop();
+            bot.pvp.stop();
+            combatMode = 'fight';
+            combatTarget = target;
+            console.log(`[Survival] Defending against nearby ${target.name}.`);
+            bot.pvp.movements = existingPassageMovements(bot);
+            bot.pvp.movements.allowParkour = false;
+            bot.pvp.movements.allowSprinting = false;
+            bot.pvp.movements.canSwim = false;
+            bot.pvp.movements.maxDropDown = 1;
+            await bot.pvp.attack(target);
+            if (bot.inventory.items().some(i => i.name === 'shield')) bot.activateItem(true);
+            };
+            if (bot.actions) await bot.actions.with(combatLease, respond);
+            else await respond();
         } catch (e) {
-            console.error("[Survival] Threat Check Error:", e);
+            if (e.code !== 'ACTION_INTERRUPTED') console.error('[Survival] Threat Check Error:', e);
+        } finally {
+            checkingThreat = false;
+            if (urgentPending) {
+                urgentPending = false;
+                setImmediate(() => checkForThreats(true));
+            }
         }
     };
 
-    // Helper to keep code clean and fix nesting
-    async function handleThreat(bot, nearbyHostile, urgent) {
-        if (!isInCombat || combatTarget !== nearbyHostile) {
-            const isRanged = nearbyHostile.name.includes('skeleton') || nearbyHostile.name.includes('witch') || nearbyHostile.name.includes('blaze');
-            const isExplosive = nearbyHostile.name.includes('creeper');
-            const hasWeapon = await equipBestWeapon(bot);
-            let safeToFight = true;
-
-            const nearbyEntities = Object.values(bot.entities).filter(e =>
-                e.type === 'mob' &&
-                hostileMobs.some(h => e.name?.includes(h)) &&
-                e.position.distanceTo(bot.entity.position) < 10
-            );
-
-            // User Rule: Do not attack if health is < 1/3 max (20/3 = ~6.66)
-            if (bot.health < 7) {
-                safeToFight = false;
-                console.log(`[Survival] Health CRITICAL (${bot.health}/20). Too low to fight. RETREATING.`);
-            } else if (nearbyEntities.length >= 2) {
-                safeToFight = false;
-                console.log(`[Survival] GROUP DETECTED (${nearbyEntities.length} >= 2)! Overwhelmed. RETREATING.`);
-            } else if (isExplosive) {
-                // CRITICAL: If we're in water, IGNORE creeper and focus on blocking water first
-                const pos = bot.entity.position;
-                const feetBlock = bot.blockAt(pos.floored());
-                const headBlock = bot.blockAt(pos.offset(0, 1.6, 0).floored());
-                const inWater = (feetBlock && feetBlock.name.includes('water')) ||
-                    (headBlock && headBlock.name.includes('water'));
-
-                if (inWater) {
-                    // In water - can't flee effectively. Let water blocking handle it.
-                    console.log(`[Survival] Creeper detected but IN WATER. Prioritizing water escape over creeper.`);
-                    return false; // Don't interrupt water escape
-                }
-
-                safeToFight = false;
-                console.log(`[Survival] Creeper identified. EXPLOSIVE HAZARD. Retreating immediately.`);
-            } else if (nearbyHostile.name.includes('zombie') && (nearbyHostile.height < 1.0 || (nearbyHostile.metadata && nearbyHostile.metadata[16]))) {
-                safeToFight = false;
-                console.log(`[Survival] Baby Zombie identified. SPEED HAZARD. Retreating immediately.`);
-            } else if (isRanged && nearbyHostile.name.includes('skeleton')) {
-                if (hasWeapon) {
-                    if (bot.health < 4) {
-                        safeToFight = false;
-                        console.log(`[Survival] CRITICAL HEALTH (${bot.health}). Retreating from Skeleton.`);
-                    } else {
-                        safeToFight = true;
-                        console.log(`[Survival] Have sword. Charging Skeleton!`);
-                    }
-                } else {
-                    safeToFight = false;
-                    console.log(`[Survival] Skeleton + No Sword -> FLEEING.`);
-                }
-            } else if (!hasWeapon && !isRanged) {
-                console.log(`[Survival] Fighting ${nearbyHostile.name} bare-handed!`);
-                safeToFight = true;
-            }
-
-            if (safeToFight) {
-                isInCombat = true;
-                combatTarget = nearbyHostile;
-                const msg = `[Survival] Engaging ${nearbyHostile.name}`;
-                console.log(msg);
-                bot.chat(msg);
-                bot.pathfinder.stop();
-                bot.pvp.stop();
-
-                // CRITICAL: Equip sword before attacking!
-                const weapon = bot.inventory.items().find(i => i.name.includes('sword'));
-                if (weapon) {
-                    try {
-                        await bot.equip(weapon, 'hand');
-                        console.log(`[Survival] Equipped ${weapon.name} for combat`);
-                    } catch (err) {
-                        console.log(`[Survival] Failed to equip weapon: ${err.message}`);
-                    }
-                }
-
-                try { bot.pvp.attack(nearbyHostile); } catch (e) { bot.attack(nearbyHostile); }
-            } else {
-                if (isInCombat || urgent || nearbyHostile.position.distanceTo(bot.entity.position) < 15) {
-                    console.log(`[Survival] Active Retreat from ${nearbyHostile.name}`);
-                    await retreat(bot, nearbyHostile);
-                }
-            }
+    let guarding = false;
+    bot.on('physicsTick', async () => {
+        if (guarding || !combatMode || !combatTarget) return;
+        guarding = true;
+        try {
+            const defend = async () => {
+                await guardWithShield(bot, combatTarget, combatMode);
+                tactics.tick(combatMode, combatTarget);
+            };
+            if (bot.actions) await bot.actions.with(combatLease, defend);
+            else await defend();
         }
-    }
+        catch (error) { if (error.code !== 'ACTION_INTERRUPTED') console.log(`[Survival] Bouclier: ${error.message}`); }
+        finally { guarding = false; }
+    });
 
     async function retreat(bot, enemy) {
-        // Calculate vector away from enemy
-        const { goals } = require('mineflayer-pathfinder');
-        const defaultMove = new goals.GoalInvert(new goals.GoalFollow(enemy, 5));
-
-        // Simpler: Pick a spot 16 blocks away in opposite direction
-        const escapeVec = bot.entity.position.minus(enemy.position).normalize().scaled(16);
-        const escapePos = bot.entity.position.plus(escapeVec);
-
-        bot.pathfinder.setGoal(new goals.GoalNear(escapePos.x, escapePos.y, escapePos.z, 2));
+        const revision = bot.threatRevision || 0;
+        if (bot.retreatProgress && bot.entity.position.distanceTo(bot.retreatProgress.position)>0.2)
+            bot.retreatProgress={position:bot.entity.position.clone(),time:Date.now()};
+        if (bot.pathfinder.isMoving() && bot.retreatTarget && bot.retreatProgress &&
+            Date.now()-bot.retreatProgress.time<3000 && bot.entity.position.distanceTo(bot.retreatTarget)>1.5) return;
+        const escape=await require('./RetreatRoute').findRetreatRoute(bot,[...routeThreats(bot),enemy]);
+        if ((bot.threatRevision || 0) !== revision) return;
+        if (escape) {
+            bot.retreatTarget=escape.target;
+            bot.retreatProgress={position:bot.entity.position.clone(),time:Date.now()};
+            bot.pathfinder.setMovements(escape.movements);
+            console.log(`[Survival] Fuite accessible de ${bot.entity.position} vers ${escape.target}.`);
+            bot.pathfinder.setGoal(escape.goal);
+            return;
+        }
+        const origin = bot.entity.position;
+        const threats = [...routeThreats(bot), enemy];
+        let best = null;
+        let fallback = null;
+        const clearance = point => Math.min(...threats.map(t =>
+            Math.abs(point.y - t.position.y) > 4 ? 100 :
+                Math.hypot(point.x - t.position.x, point.z - t.position.z)));
+        const initialClearance = clearance(origin);
+        for (let i = 0; i < 8; i++) {
+            const angle = 2 * Math.PI * i / 8;
+            const point = origin.offset(Math.cos(angle) * 12, 0, Math.sin(angle) * 12);
+            const nearest = clearance(point);
+            const goal = new goals.GoalNearXZ(point.x, point.z, 2);
+            const route = bot.pathfinder.getPathTo(bot.pathfinder.movements, goal, 100);
+            if (route.path.length < 2 || route.path.some(step => step.y < origin.y - 1)) continue;
+            const laterSteps = route.path.slice(1, 12);
+            const worstClearance = Math.min(...laterSteps.map(clearance));
+            const score = nearest + worstClearance * 2 - route.path.length * 0.2;
+            if (!fallback || score > fallback.score) fallback = { goal, score };
+            if (route.status !== 'success' ||
+                worstClearance < initialClearance - 0.5) continue;
+            if (!best || score > best.score) best = { goal, score };
+        }
+        if (!best) console.log('[Survival] No complete retreat path; choosing the least exposed partial route.');
+        if (best || fallback) bot.pathfinder.setGoal((best || fallback).goal);
+        else bot.pathfinder.stop();
     }
 
+    let lastCrowdWarning = 0;
+    bot.on('path_update', result => {
+        if (bot.actions?.current && bot.actions.current.owner !== 'agent') return;
+        if (combatMode || !result.path?.length) return;
+        if (bot.isFoodExploring && !require('./ExplorationSafety').safeExplorationPath(bot,result.path)) {
+            console.log('[Survival] Exploration arretee : bord expose ou support incertain.');
+            if (bot.actions) bot.actions.cancel('Trajet d exploration dangereux');
+            else { bot.pathfinder.setGoal(null); bot.clearControlStates(); }
+            return;
+        }
+        const threat = threatNearPath(bot, result.path);
+        if (!threat) return;
+        if (Date.now() - lastCrowdWarning > 5000) {
+            lastCrowdWarning = Date.now();
+            console.log(`[Survival] Unsafe path near ${threat.name}; replanning away from mobs.`);
+            try { bot.chat(`[SpeedBot] Trajet refuse: mobs proches (${threat.name}).`); } catch (_) { }
+        }
+        if (bot.actions) bot.actions.cancel('Trajet expose aux mobs');
+        else bot.pathfinder.stop();
+    });
+
     // Check threats periodically
-    setInterval(() => checkForThreats(false), 500);
+    const threatTimer = setInterval(() => checkForThreats(false), 200);
+    bot.once('end', () => clearInterval(threatTimer));
 
     // Expose combat state
-    bot.isInCombat = () => isInCombat;
+    bot.isInCombat = () => combatMode !== null;
 
     // Safe position tracking - save position when NOT in water + check for falling blocks
-    let safeCheckInterval = setInterval(() => {
+    let hazardBusy = false;
+    let safeCheckInterval = setInterval(async () => {
         if (!bot.entity) return;
 
         const pos = bot.entity.position;
@@ -280,17 +388,24 @@ function setupSurvival(bot) {
         // CRITICAL: Check for falling blocks (gravel/sand) above
         for (let y = 1; y <= 3; y++) {
             const blockAbove = bot.blockAt(pos.offset(0, y, 0).floored());
-            if (blockAbove && (blockAbove.name === 'gravel' || blockAbove.name === 'sand')) {
+            const falling = Object.values(bot.entities).some(e => e.name === 'falling_block' && e.position?.distanceTo(pos) < 3);
+            if (!hazardBusy && falling && blockAbove && (blockAbove.name === 'gravel' || blockAbove.name === 'sand')) {
                 console.log(`[Survival] DANGER: ${blockAbove.name} detected ${y} blocks above! Moving away!`);
                 // Move sideways immediately
-                const escapeX = Math.random() > 0.5 ? 2 : -2;
-                const escapeZ = Math.random() > 0.5 ? 2 : -2;
-                bot.pathfinder.setGoal(null);
-                bot.pathfinder.setGoal(new (require('mineflayer-pathfinder').goals.GoalBlock)(
-                    Math.floor(pos.x + escapeX),
-                    Math.floor(pos.y),
-                    Math.floor(pos.z + escapeZ)
-                ));
+                const target = [[1,0],[-1,0],[0,1],[0,-1]].map(([x,z]) => pos.floored().offset(x,0,z))
+                    .find(p => bot.blockAt(p)?.boundingBox === 'empty' && bot.blockAt(p.offset(0,1,0))?.boundingBox === 'empty' &&
+                        require('./ExplorationSafety').safeExplorationStep(bot,p));
+                if (!target) break;
+                hazardBusy = true;
+                const escape = async () => {
+                    bot.pathfinder.setMovements(existingPassageMovements(bot));
+                    await require('./Pathing').withTimeout(bot,bot.pathfinder.goto(new goals.GoalBlock(target.x,target.y,target.z)),2000,'Bloc tombant');
+                };
+                try {
+                    if (bot.actions) await bot.actions.run('danger',110,escape);
+                    else await escape();
+                } catch (error) { console.log(`[Survival] Evasion: ${error.message}`); }
+                finally { hazardBusy = false; }
                 break;
             }
         }
@@ -304,26 +419,41 @@ function setupSurvival(bot) {
             }
         }
     }, 1000); // Check every second
+    bot.once('end', () => clearInterval(safeCheckInterval));
 
 
     // Water escape system AND Stuck-On-Land Detection
     let lastWaterCheck = Date.now();
+    const waterEscape = new (require('./WaterEscape'))(bot);
     let inWaterTicks = 0;
     let escapeAttempts = 0;
     let lastBlockPlacement = 0; // Cooldown for water blocking
+    let activePath = [];
+    let lastProgress = null;
+    let lastProgressTime = Date.now();
+    let lastStallReport = 0;
+    let clearingStep = false;
+    let lastClearAttempt = 0;
+    let lastWaypointAttempt = 0;
+    bot.on('path_update', result => { activePath = result.path; });
 
-    // Land stuck detection
-    let lastPosition = null;
-    let lastMoveTime = Date.now();
-    let stuckOnLandTicks = 0;
-
+    bot.on('physicsTick', () => {
+        if (bot.actions?.current && bot.actions.current.owner !== 'agent') return;
+        if (!bot.isFoodExploring || !bot.entity?.onGround || !bot.pathfinder.isMoving()) return;
+        const velocity = bot.entity.velocity;
+        const speed = Math.hypot(velocity.x,velocity.z);
+        if (speed < 0.02) return;
+        const next = bot.entity.position.offset(velocity.x/speed*0.65,0,velocity.z/speed*0.65).floored();
+        if (!require('./ExplorationSafety').safeExplorationProbe(bot,next,activePath)) {
+            console.log('[Survival] Exploration arretee avant un bord dangereux.');
+            if (bot.actions) bot.actions.cancel('Bord dangereux en exploration');
+            else { bot.pathfinder.setGoal(null); bot.clearControlStates(); }
+        }
+    });
 
     bot.on('physicsTick', async () => {
         if (Date.now() - lastWaterCheck < 300) return;
         lastWaterCheck = Date.now();
-
-        // Prevent interrupting ongoing actions
-        if (bot.targetDigBlock || bot.pathfinder.isMining()) return;
 
         const pos = bot.entity.position;
         const feetBlock = bot.blockAt(pos.floored());
@@ -331,292 +461,57 @@ function setupSurvival(bot) {
 
         const inWater = (feetBlock && feetBlock.name.includes('water')) ||
             (headBlock && headBlock.name.includes('water'));
+        if (inWater) { await waterEscape.tick(true); return; }
+        await waterEscape.tick(false);
+        if (bot.isInCombat?.() || bot.targetDigBlock || bot.pathfinder.isMining()) return;
 
-        // 1. LAND STUCK DETECTION (If attempting to move but position not changing)
         if (bot.pathfinder.isMoving() && !inWater) {
-            const currentPos = bot.entity.position;
-            if (lastPosition) {
-                const dist = currentPos.distanceTo(lastPosition);
-                if (dist < 0.2) { // Moved less than 0.2 blocks in ~300ms
-                    stuckOnLandTicks++;
-                } else {
-                    stuckOnLandTicks = 0;
-                    lastPosition = currentPos.clone();
-                }
-            } else {
-                lastPosition = currentPos.clone();
-            }
-
-            if (stuckOnLandTicks > 5) { // Stuck for ~1.5 seconds
-                console.log(`[Survival] Stuck on land (diagonal/block)? JUMPING to unstuck.`);
-                bot.setControlState('jump', true);
-                bot.setControlState('sprint', false);
-
-                // If really stuck, strafe slightly
-                if (stuckOnLandTicks > 10) {
-                    const strafeState = Math.random() > 0.5 ? 'left' : 'right';
-                    bot.setControlState(strafeState, true);
-                    setTimeout(() => bot.setControlState(strafeState, false), 500);
-                }
-
-                // If EXTREMELY stuck, stop pathfinder to verify path
-                if (stuckOnLandTicks > 20) {
-                    console.log(`[Survival] EXTREMELY stuck. Resetting pathfinder.`);
-                    bot.pathfinder.stop();
-                    stuckOnLandTicks = 0;
-                }
-            } else {
-                // Reset jump if we were stuck but now moving (unless water)
-                if (!inWater) bot.setControlState('jump', false);
-            }
-        }
-
-        if (inWater) {
-            // ... existing water logic ...
-
-            inWaterTicks++;
-
-            // Always jump AND sprint when in water to escape currents
-            bot.setControlState('jump', true);
-            bot.setControlState('sprint', true);
-
-            if (inWaterTicks > 5) {
-                escapeAttempts++;
-
-                // STRATEGY 0: BLOCK THE WATER CURRENT (if stuck for too long)
-                // Cooldown: Only try every 10 seconds
-                if (escapeAttempts > 3 && escapeAttempts % 5 === 0 && (Date.now() - lastBlockPlacement >= 10000)) {
-                    // Try to place a block to stop the current
-                    const blockItems = bot.inventory.items().filter(i =>
-                        i.name === 'cobblestone' ||
-                        i.name === 'dirt' ||
-                        i.name.includes('planks') ||
-                        i.name === 'stone'
-                    );
-
-
-                    if (blockItems.length > 0) {
+            if (!lastProgress || pos.distanceTo(lastProgress) > 0.2) {
+                lastProgress = pos.clone();
+                lastProgressTime = Date.now();
+            } else if (Date.now() - lastProgressTime > 3000 && Date.now() - lastStallReport > 5000) {
+                lastStallReport = Date.now();
+                const next = activePath[0];
+                console.log(`[Survival] Path stalled at ${pos}, next=${next ? `${next.x},${next.y},${next.z}` : 'none'}, onGround=${bot.entity.onGround}, forward=${bot.getControlState('forward')}, jump=${bot.getControlState('jump')}`);
+                if (!clearingStep && Date.now() - lastProgressTime > 4000 &&
+                    Date.now() - lastClearAttempt > 30000) {
+                    const obstacle = findBlockingStep(bot, pos, next);
+                    if (obstacle) {
+                        clearingStep = true;
+                        bot.isClearingObstacle = true;
+                        lastClearAttempt = Date.now();
+                        console.log(`[Survival] Clearing blocking ${obstacle.name} at ${obstacle.position}.`);
+                        const clearObstacle = async () => {
+                        bot.pathfinder.stop();
                         try {
-                            console.log('[Survival] BLOCKING WATER CURRENT with', blockItems[0].name);
-                            await bot.equip(blockItems[0], 'hand');
-
-                            // Scan water blocks around feet to find flow direction
-                            const feetPos = pos.floored();
-                            const directions = [
-                                { dx: 1, dz: 0, name: 'East' },
-                                { dx: -1, dz: 0, name: 'West' },
-                                { dx: 0, dz: 1, name: 'South' },
-                                { dx: 0, dz: -1, name: 'North' }
-                            ];
-
-                            let sourceDirection = null;
-                            let lowestLevel = 99;
-
-                            // Find water source (lowest level = source block)
-                            for (const dir of directions) {
-                                const checkPos = feetPos.offset(dir.dx, 0, dir.dz);
-                                const checkBlock = bot.blockAt(checkPos);
-
-                                if (checkBlock && checkBlock.name.includes('water')) {
-                                    const level = checkBlock.metadata || 0;
-                                    if (level < lowestLevel) {
-                                        lowestLevel = level;
-                                        sourceDirection = dir;
-                                    }
-                                }
-                            }
-
-                            // Fallback to velocity if no water found
-                            if (!sourceDirection) {
-                                const vel = bot.entity.velocity;
-                                if (Math.abs(vel.x) > Math.abs(vel.z)) {
-                                    sourceDirection = vel.x > 0 ? { dx: 1, dz: 0, name: 'East' } : { dx: -1, dz: 0, name: 'West' };
-                                } else {
-                                    sourceDirection = vel.z > 0 ? { dx: 0, dz: 1, name: 'South' } : { dx: 0, dz: -1, name: 'North' };
-                                }
-                            }
-
-                            console.log(`[Survival] Water source from ${sourceDirection.name} (level ${lowestLevel})`);
-
-                            // Place block at the source to block current
-                            const placePos = feetPos.offset(sourceDirection.dx, 0, sourceDirection.dz);
-                            const placeBlock = bot.blockAt(placePos);
-
-                            if (placeBlock && placeBlock.name === 'water') {
-                                const referenceBlock = bot.blockAt(placePos.offset(0, -1, 0));
-                                if (referenceBlock && referenceBlock.name !== 'air') {
-                                    await bot.placeBlock(referenceBlock, new (require('vec3'))(0, 1, 0));
-                                    console.log('[Survival] Water block placed! Current should stop.');
-
-                                    // CRITICAL: Blacklist this block to NEVER mine it
-                                    const blockKey = `${placePos.x},${placePos.y},${placePos.z}`;
-                                    protectedBlocks.add(blockKey);
-                                    console.log(`[Survival] Block ${blockKey} protected from mining.`);
-
-                                    // Move AWAY from the placed block (opposite direction)
-                                    const escapePos = feetPos.offset(-sourceDirection.dx * 2, 0, -sourceDirection.dz * 2);
-                                    const { goals } = require('mineflayer-pathfinder');
-                                    bot.pathfinder.setGoal(new goals.GoalBlock(escapePos.x, escapePos.y, escapePos.z));
-                                    console.log(`[Survival] Moving away from water block to ${escapePos.x}, ${escapePos.z}`);
-
-                                    // Reset counters - water blocked, bot can continue task
-                                    inWaterTicks = 0;
-                                    escapeAttempts = 0;
-
-                                    await bot.waitForTicks(20); // Wait 1s for movement
-                                    return; // Don't escape, let task continue
-                                }
-                            }
-                        } catch (err) {
-                            // Failed to place, continue to next strategy
+                            const tool = bot.pathfinder.bestHarvestTool(obstacle);
+                            if (tool) await bot.equip(tool, 'hand');
+                            await bot.dig(obstacle, true);
+                        } catch (error) {
+                            console.log(`[Survival] Could not clear obstacle: ${error.message}`);
+                        } finally {
+                            bot.isClearingObstacle = false;
+                            clearingStep = false;
+                        }
+                        };
+                        try {
+                            if (bot.actions) await bot.actions.run('obstacle',40,clearObstacle);
+                            else await clearObstacle();
+                        } finally { clearingStep = false; bot.isClearingObstacle = false; }
+                    } else if (!bot.actions && Date.now() - lastWaypointAttempt > 8000) {
+                        const waypoint = findCardinalWaypoint(bot, pos, next);
+                        if (waypoint) {
+                            lastWaypointAttempt = Date.now();
+                            console.log(`[Survival] Aligning through safe step ${waypoint} before diagonal target.`);
+                            bot.pathfinder.setGoal(new goals.GoalBlock(waypoint.x, waypoint.y, waypoint.z));
                         }
                     }
-                }
-
-                // Strategy 1: IMMEDIATE PATHFIND TO LAND
-                // User requirement: Do NOT build blocks. Just swim out.
-                if (escapeAttempts > 0) {
-                    // Check if we are already following a path
-                    if (bot.pathfinder.isMoving()) {
-                        // Let it move
-                        return;
-                    }
-
-                    const landBlock = bot.findBlock({
-                        matching: (block) => {
-                            if (!block || !block.position || block.name === 'air' || block.name.includes('water') || block.name.includes('lava')) return false;
-                            // Check if there's air above (so bot can stand)
-                            const above = bot.blockAt(block.position.offset(0, 1, 0));
-                            return above && above.name === 'air';
-                        },
-                        maxDistance: 32
-                    });
-
-                    if (landBlock) {
-                        try {
-                            const { goals } = require('mineflayer-pathfinder');
-                            bot.pathfinder.setGoal(new goals.GoalBlock(landBlock.position.x, landBlock.position.y + 1, landBlock.position.z));
-                        } catch (e) { }
-                    }
-                }
-
-                // Try to place blocks around to block water current - DISABLED
-                // if (escapeAttempts > 3 && escapeAttempts % 3 === 0) {
-                //    await tryPlaceBlockAround(bot, mcData);
-                // }
-
-                // Strategy 2: After 10 attempts, swim straight up aggressively with sprint
-                if (escapeAttempts > 10 && escapeAttempts < 25) {
-                    console.log(`[Survival] Sprint swimming straight up to surface!`);
-                    bot.pathfinder.stop();
-                    bot.setControlState('forward', false);
-                    bot.setControlState('sprint', true);
-                    bot.setControlState('jump', true);
-
-                    // Look straight up
-                    bot.look(0, -Math.PI / 2, true);
-                }
-
-                // Strategy 3: After 25 attempts, find and go to nearest land (reduced from 50)
-                if (escapeAttempts > 25) {
-                    // Hard limit: reset if stuck for too long (prevents memory issues)
-                    if (escapeAttempts > 100) {
-                        console.log('[Survival] CRITICAL: Stuck for too long! Force resetting escape attempts.');
-                        escapeAttempts = 0;
-                        bot.setControlState('forward', false);
-                        bot.setControlState('sprint', false);
-                        bot.setControlState('jump', true);
-                        if (inWaterTicks > 100) {
-                            // 5 seconds in water -> stuck?
-                            // Panic Place is causing messes. Disabled/Commented out based on user feedback.
-                            // The Pathfinder escape above should handle it.
-                            /*
-                            console.log('[Survival] Stuck in water too long! Trying to build pillar...');
-                            await tryPlaceBlockUnderFeet(bot, mcData);
-                            inWaterTicks = 0; // Reset timer
-                            */
-                        }
-                        return;
-                    }
-
-                    console.log(`[Survival] Stuck too long! Searching for nearest land...`);
-
-                    // Stop current movement
-                    bot.pathfinder.stop();
-                    bot.setControlState('forward', false);
-                    bot.setControlState('sprint', true);
-                    bot.setControlState('jump', true);
-
-                    // Try to find dry land nearby (INCREASED RANGE)
-                    const landBlock = bot.findBlock({
-                        matching: (block) => {
-                            if (!block || !block.position || block.name === 'air' || block.name.includes('water')) return false;
-                            // Must be solid and above water level
-                            if (block.position.y < 64) return false;
-                            // Check if there's air above (so bot can stand)
-                            const above = bot.blockAt(block.position.offset(0, 1, 0));
-                            const above2 = bot.blockAt(block.position.offset(0, 2, 0));
-                            return above && above.name === 'air' && above2 && above2.name === 'air';
-                        },
-                        maxDistance: 64, // Doubled from 32
-                        count: 1
-                    });
-
-                    if (landBlock) {
-                        console.log(`[Survival] Found land at ${landBlock.position.x}, ${landBlock.position.y}, ${landBlock.position.z}!`);
-                        const targetPos = landBlock.position.offset(0, 1, 0);
-
-                        // Just set a movement goal - don't use pathfinder which would make us swim
-                        // Instead, just keep jumping and moving forward manually
-                        const direction = targetPos.minus(pos);
-                        const yaw = Math.atan2(-direction.x, -direction.z);
-                        bot.look(yaw, 0, true);
-
-                        bot.setControlState('forward', true);
-                        bot.setControlState('sprint', true);
-                        bot.setControlState('jump', true);
-
-                        setTimeout(() => {
-                            bot.setControlState('forward', false);
-                            escapeAttempts = 0;
-                        }, 5000);
-                    } else if (lastSafePosition && lastSafePosition.y >= 60) {
-                        console.log(`[Survival] No land found nearby, returning to last safe position at ${lastSafePosition.x.toFixed(0)}, ${lastSafePosition.y.toFixed(0)}, ${lastSafePosition.z.toFixed(0)}`);
-
-                        // Manually navigate towards safe position without pathfinder
-                        const direction = lastSafePosition.minus(pos);
-                        const yaw = Math.atan2(-direction.x, -direction.z);
-                        bot.look(yaw, 0, true);
-
-                        bot.setControlState('forward', true);
-                        bot.setControlState('sprint', true);
-                        bot.setControlState('jump', true);
-
-                        setTimeout(() => {
-                            bot.setControlState('forward', false);
-                            escapeAttempts = 0;
-                        }, 5000);
-                    } else {
-                        console.log('[Survival] No land or safe position found, continuing to swim up...');
-                        escapeAttempts = 0; // Reset to try again
-                    }
-
-                    return;
-                }
-
-                // Log occasionally
-                if (escapeAttempts % 10 === 1) {
-                    console.log(`[Survival] Escaping water... attempt ${escapeAttempts}`);
                 }
             }
         } else {
-            if (inWaterTicks > 5) {
-                console.log('[Survival] Escaped from water!');
-                escapeAttempts = 0;
-            }
-            inWaterTicks = 0;
-            bot.setControlState('jump', false);
+            lastProgress = null;
         }
+
     });
 
     // Expose safe position for other modules
@@ -923,6 +818,8 @@ async function equipBestWeapon(bot) {
 // Configure pathfinder to avoid water and NOT dig under feet
 // Configure pathfinder to avoid water and NOT dig under feet
 function configurePathfinder(bot) {
+    bot.pathfinder.searchRadius = 32;
+    bot.pathfinder.thinkTimeout = 1500;
     const { Movements } = require('mineflayer-pathfinder');
     const mcData = require('minecraft-data')(bot.version);
 
@@ -943,7 +840,6 @@ function configurePathfinder(bot) {
     // Protect Crafting Table
     if (mcData.blocksByName.crafting_table) {
         movements.blocksCantBreak.add(mcData.blocksByName.crafting_table.id);
-        movements.safeToBreak = (block) => block.type !== mcData.blocksByName.crafting_table.id;
     }
 
     // Strongly avoid water - treat it as if it's a solid wall
@@ -958,11 +854,25 @@ function configurePathfinder(bot) {
 
     // Don't swim
     movements.canSwim = false;
+    movements.maxDropDown = 1;
+    movements.allowParkour = false;
+    movements.entityCost = 25;
+    for (const name of ['zombie', 'husk', 'drowned', 'skeleton', 'stray',
+        'creeper', 'spider', 'cave_spider', 'witch', 'enderman', 'slime',
+        'pillager', 'vindicator', 'ravager', 'blaze', 'hoglin', 'warden']) {
+        movements.entitiesToAvoid.add(name);
+    }
+
+    // A diagonal between two solid blocks can be considered valid by the planner
+    // even though the player hitbox cannot pass the corner. Use cardinal steps.
+    disableDiagonalMoves(movements);
+    // The pathfinder's post-processing can reintroduce diagonal shortcuts.
+    bot.pathfinder.enablePathShortcut = false;
 
     // Add custom safeToBreak to prevent paths through water
     const originalSafeToBreak = movements.safeToBreak;
     movements.safeToBreak = function (block) {
-        if (!block) return false;
+        if (!block || typeof block.digTime !== 'function') return false;
 
         // Never consider crafting table safe to break
         if (block.name === 'crafting_table') return false;

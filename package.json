@@ -4,7 +4,10 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test",
+    "autopilot": "node tools/autopilot.cjs start",
+    "autopilot:status": "node tools/autopilot.cjs status",
+    "autopilot:stop": "node tools/autopilot.cjs stop"
   },
   "keywords": [],
   "author": "",

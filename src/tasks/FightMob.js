@@ -1,5 +1,6 @@
 const Task = require('../lib/Task');
 const { goals } = require('mineflayer-pathfinder');
+const { equipDefense } = require('../lib/Defense');
 
 class FightMob extends Task {
     constructor(bot, mobType, killCount = 1) {
@@ -38,11 +39,12 @@ class FightMob extends Task {
         console.log(`[${this.name}] Found ${this.mobType} at distance ${this.bot.entity.position.distanceTo(mob.position).toFixed(1)}`);
 
         // Equip best weapon
-        await this.equipBestWeapon();
+        const gear = await equipDefense(this.bot);
 
         // Use PvP plugin to attack
         try {
             this.bot.pvp.attack(mob);
+            if (gear.shield) this.bot.activateItem(true);
 
             // Wait for mob to die or timeout
             const startTime = Date.now();
@@ -56,6 +58,7 @@ class FightMob extends Task {
             }
 
             this.bot.pvp.stop();
+            this.bot.deactivateItem();
         } catch (err) {
             console.log(`[${this.name}] Fight error: ${err.message}`);
             this.bot.pvp.stop();

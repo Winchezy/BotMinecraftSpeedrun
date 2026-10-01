@@ -1,5 +1,9 @@
 const Task = require('../lib/Task');
 const { goals } = require('mineflayer-pathfinder');
+const { isAtSurface } = require('../lib/Trail');
+const MoveToSurface = require('./MoveToSurface');
+const { existingPassageMovements, planCompletePath, withTimeout } = require('../lib/Pathing');
+const { threatNearPoint, threatNearPath } = require('../lib/MobSafety');
 
 class GetWood extends Task {
     constructor(bot, targetCount = 5) {
@@ -11,60 +15,45 @@ class GetWood extends Task {
     }
 
     async run() {
+        if (this.bot.isInCombat?.()) return;
+        if (this.bot.entity?.onGround === false) return;
+        this.treeEscape ||= new (require('../lib/TreeEscape'))(this.bot);
+        if (this.treeEscape.onTree() && this.bot.canDigBlock) {
+            if (!this.treeNotice) {
+                this.treeNotice = true;
+                this.bot.chat?.('[SpeedBot] Je suis sur un arbre : descente prudente avant de poursuivre.');
+            }
+            if (await this.treeEscape.run()) return;
+            // Pas de trajet aleatoire a la hauteur des cimes si la descente echoue.
+            console.log('[GetWood] Descente de l arbre sans passage sur pour le moment.');
+            return;
+        }
         const logs = this.countLogs();
         if (logs >= this.targetCount) {
             this.complete();
             return;
         }
+        const nearbyLogs = this.bot.findBlocks({
+            matching: block => block.name.endsWith('_log') && !block.name.startsWith('stripped_'),
+            maxDistance: 32, count: 30
+        });
+        const targetLog = await this.findReachableLog(nearbyLogs);
+        if (this.bot.isInCombat?.()) return;
+        if (!targetLog && !isAtSurface(this.bot)) {
+            this.surfaceTask ||= new MoveToSurface(this.bot);
+            await this.surfaceTask.run();
+            if (this.surfaceTask.hasFailed) this.fail(this.surfaceTask.failureReason);
+            return;
+        }
 
         console.log(`[${this.name}] Have ${logs}/${this.targetCount} logs.`);
 
-        // Find nearest log that's NOT surrounded by water
-        const logBlocks = this.bot.findBlocks({
-            matching: (block) => block.name.includes('log') && !block.name.includes('stripped'),
-            maxDistance: 64,
-            count: 30
-        });
-
-        // Find the LOWEST log (tree base) to mine from ground
-        let targetLog = null;
-        for (const pos of logBlocks) {
-            const posKey = `${pos.x},${pos.y},${pos.z}`;
-            if (this.blacklistedPositions.has(posKey)) continue;
-
-            const log = this.bot.blockAt(pos);
-            if (!log) continue;
-
-            // Check if this is a base log (solid block below, or low Y)
-            const blockBelow = this.bot.blockAt(pos.offset(0, -1, 0));
-            const isBase = blockBelow && (blockBelow.name === 'grass_block' || blockBelow.name === 'dirt' || blockBelow.name === 'stone' || pos.y < this.bot.entity.position.y + 3);
-
-            if (isBase) {
-                targetLog = log;
-                break;
-            }
-        }
-
         if (!targetLog) {
-            // Fall back to LOWEST available log
-            let lowestY = 999;
-            for (const pos of logBlocks) {
-                const posKey = `${pos.x},${pos.y},${pos.z}`;
-                if (this.blacklistedPositions.has(posKey)) continue;
-
-                if (pos.y < lowestY) {
-                    lowestY = pos.y;
-                    targetLog = this.bot.blockAt(pos);
-                }
-            }
-
-            if (!targetLog) {
                 console.log(`[${this.name}] No accessible trees found. Wandering...`);
                 // Clear blacklist after wandering
                 this.blacklistedPositions.clear();
                 await this.wander();
                 return;
-            }
         }
 
         const targetPosKey = `${targetLog.position.x},${targetLog.position.y},${targetLog.position.z}`;
@@ -74,11 +63,7 @@ class GetWood extends Task {
         try {
             // Use timeout to prevent hanging
             const collectPromise = this.bot.collectBlock.collect(targetLog);
-            const timeoutPromise = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('Timeout')), 15000)
-            );
-
-            await Promise.race([collectPromise, timeoutPromise]);
+            await withTimeout(this.bot, collectPromise, 15000, 'Collecte de bois bloquee');
 
             // collectBlock peut se terminer SANS erreur alors que rien n'a ete mine
             // (bot jamais arrive a l'arbre : pathfinder interrompu par Survival, arbre
@@ -93,12 +78,35 @@ class GetWood extends Task {
                 await this.stuckHandler();
             }
         } catch (err) {
+            // Le timeout doit vraiment arreter le plugin avant le prochain arbre.
+            if (this.bot.collectBlock.cancelTask) {
+                try { await withTimeout(this.bot, this.bot.collectBlock.cancelTask(), 2000, 'Annulation collecte'); }
+                catch (_) { }
+            }
+            if (this.bot.isInCombat?.()) return;
             console.log(`[${this.name}] Collect error: ${err.message}`);
             // Blacklist this position
             this.blacklistedPositions.add(targetPosKey);
             console.log(`[${this.name}] Blacklisted position ${targetPosKey}`);
             await this.stuckHandler();
         }
+    }
+
+    async findReachableLog(positions) {
+        const bot = this.bot;
+        const feet = bot.entity.position.floored();
+        const walking = existingPassageMovements(bot);
+        positions.sort((a, b) => a.distanceTo(bot.entity.position) - b.distanceTo(bot.entity.position));
+        for (const pos of positions.slice(0, 12)) {
+            if (this.blacklistedPositions.has(`${pos.x},${pos.y},${pos.z}`) ||
+                (pos.x === feet.x && pos.z === feet.z && pos.y < feet.y) ||
+                !this.isAccessible(pos) || threatNearPoint(bot, pos, 2)) continue;
+            const goal = new goals.GoalLookAtBlock(pos, bot.world, { reach: 4 });
+            const route = await planCompletePath(bot, goal, 500, walking);
+            if (bot.isInCombat?.()) return null;
+            if (route.status === 'success' && !threatNearPath(bot, route.path)) return bot.blockAt(pos);
+        }
+        return null;
     }
 
     // Check if a log position is accessible without going through water

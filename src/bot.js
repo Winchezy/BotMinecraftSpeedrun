@@ -26,17 +26,28 @@ function createBot(host, port, username) {
         const mcData = require('minecraft-data')(bot.version);
 
         // Setup survival (anti-drown, respawn, etc.)
+        require('./lib/Pathing').makeIdleStopImmediate(bot);
+        bot.actions = new (require('./lib/ActionController'))(bot);
         const { setupSurvival, configurePathfinder } = require('./lib/Survival');
         setupSurvival(bot);
         configurePathfinder(bot);
+        // Trace du chemin parcouru sous terre, pour que MoveToSurface la reprenne.
+        require('./lib/Trail').attachTrail(bot);
 
         const agent = new Agent(bot);
+        bot.behaviorObserver = new (require('./lib/BehaviorObserver'))(bot, agent);
 
         loop(bot, agent);
     });
 
     bot.on('kicked', console.log);
     bot.on('error', console.log);
+    const memoryTimer = setInterval(() => {
+        const memory = process.memoryUsage();
+        console.log(`[Memory] heap=${Math.round(memory.heapUsed / 1048576)}MB rss=${Math.round(memory.rss / 1048576)}MB`);
+    }, 30000);
+    bot.once('end', () => clearInterval(memoryTimer));
+    return bot;
 }
 
 process.on('uncaughtException', (err) => {
@@ -47,14 +58,17 @@ process.on('unhandledRejection', (err) => {
 });
 
 async function loop(bot, agent) {
-    while (true) {
+    let connected = true;
+    bot.once('end', () => { connected = false; });
+    while (connected) {
         try {
-            await agent.tick();
+            if (bot.isInCombat?.()) agent.combatPreparation.noteBlocked();
+            await bot.actions.run('agent', 20, () => agent.tick());
         } catch (err) {
             console.error('Agent error:', err);
             await bot.waitForTicks(5);
         }
-        await bot.waitForTicks(5); // Reduced from 20 to 5 ticks for faster execution
+        if (connected) await bot.waitForTicks(2);
     }
 }
 

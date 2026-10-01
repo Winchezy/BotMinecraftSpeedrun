@@ -8,4 +8,11 @@ const port = parseInt(args[1]) || 25565;
 const username = args[2] || 'SpeedrunBot';
 
 console.log(`Starting bot on ${host}:${port} as ${username}`);
-createBot(host, port, username);
+const bot = createBot(host, port, username);
+// Le superviseur peut deconnecter proprement son propre joueur avant une relance.
+process.on('message', message => {
+    if (message?.type !== 'shutdown') return;
+    bot.behaviorObserver?.stop();
+    bot.quit('Relance par le superviseur');
+    setTimeout(() => process.exit(0), 500).unref();
+});

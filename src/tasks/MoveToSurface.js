@@ -1,4 +1,7 @@
 const Task = require('../lib/Task');
+const { goals } = require('mineflayer-pathfinder');
+const { existingPassageMovements, planCompletePath, withTimeout } = require('../lib/Pathing');
+const { threatNearPath, threatNearPoint, routeThreats, hasMobAccess } = require('../lib/MobSafety');
 
 class MoveToSurface extends Task {
     constructor(bot) {
@@ -14,7 +17,7 @@ class MoveToSurface extends Task {
         // Increase failure limit to 150
         if (this.attempts > 150) {
             console.log('[MoveToSurface] Max attempts reached, completing task');
-            this.complete();
+            this.fail('Remontee impossible dans la limite des tentatives');
             return;
         }
 
@@ -31,6 +34,18 @@ class MoveToSurface extends Task {
         }
 
         console.log(`[MoveToSurface] Current Y: ${pos.y.toFixed(0)} | Attempt ${this.attempts}`);
+
+        // 1. Reprendre le chemin deja creuse depuis la surface (fil d'Ariane).
+        if (await this.retraceTrail()) return;
+        if (await this.findOpenAscent()) return;
+        if (!this.bot.inventory.items().some(i => i.name.endsWith('_pickaxe'))) {
+            if (!this.warnedNoPickaxe) {
+                this.bot.chat('[SpeedBot] Plus de pioche : je cherche une sortie par les passages ouverts.');
+                this.warnedNoPickaxe = true;
+            }
+            // Le manque de pioche n'empeche pas de casser lentement la pierre
+            // a la main pour sortir ; aucun minerai ni drop n'est recherche ici.
+        }
 
         // Check for stuck (simple Y check)
         if (this.lastY === undefined || Math.abs(pos.y - this.lastY) > 0.5) {
@@ -51,7 +66,7 @@ class MoveToSurface extends Task {
         const placeableItems = this.bot.inventory.items().filter(i =>
             i.name === 'cobblestone' || i.name === 'dirt' || i.name === 'stone' ||
             i.name === 'netherrack' || i.name === 'andesite' || i.name === 'diorite' ||
-            i.name === 'granite' || i.name.includes('planks') || i.name.includes('log')
+            i.name === 'granite' || i.name === 'moss_block' || i.name === 'clay' || i.name.includes('planks') || i.name.includes('log')
         );
 
         if (placeableItems.length > 0) {
@@ -59,6 +74,85 @@ class MoveToSurface extends Task {
         } else {
             await this.doStaircaseUp(pos);
         }
+    }
+
+    // Remonte la trace enregistree par lib/Trail par petits sauts vers la surface.
+    // Retourne true si on a avance (ou tente) via la trace ; false -> repli pilier/escalier.
+    async retraceTrail() {
+        const trail = this.bot.trail;
+        if (!trail || this.trailFailures >= 3 || trail.points.length < 2) return false;
+
+        const waypoint = trail.nextWaypoint(this.bot.entity.position);
+        if (!waypoint) {
+            console.log('[MoveToSurface] Trace trop loin du bot -> methode classique.');
+            this.trailFailures = 3;
+            return false;
+        }
+
+        const { goals } = require('mineflayer-pathfinder');
+        const p = waypoint.point;
+        console.log(`[MoveToSurface] Retour par le chemin creuse : point ${waypoint.index}/${trail.points.length - 1} ${p}`);
+        let timer;
+        const original = this.bot.pathfinder.movements;
+        const walking = existingPassageMovements(this.bot);
+        const goal = new goals.GoalNear(p.x, p.y, p.z, 1);
+        const route = await planCompletePath(this.bot, goal, 1500, walking);
+        if (route.status !== 'success' || threatNearPath(this.bot, route.path)) {
+            this.trailFailures = (this.trailFailures || 0) + 1;
+            return false;
+        }
+        this.bot.pathfinder.setMovements(walking);
+        const trip = this.bot.pathfinder.goto(goal);
+        trip.catch(() => { }); // rejet tardif apres le timeout : deja traite
+        try {
+            await Promise.race([
+                trip,
+                new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timeout trace')), 20000); })
+            ]);
+            this.trailFailures = 0;
+            if (waypoint.index === 0) {
+                // Point d'entree atteint : si le ciel n'est pas visible ici, la trace ne
+                // peut plus aider (surface modifiee...) -> methode classique.
+                this.trailFailures = 3;
+            }
+        } catch (e) {
+            this.trailFailures = (this.trailFailures || 0) + 1;
+            console.log(`[MoveToSurface] Trace: echec ${this.trailFailures}/3 (${e.message})`);
+            try { this.bot.pathfinder.stop(); } catch (_) { }
+        } finally {
+            clearTimeout(timer);
+            if (this.bot.pathfinder.movements === walking) this.bot.pathfinder.setMovements(original);
+        }
+        return true;
+    }
+
+    async findOpenAscent() {
+        if (Date.now() < (this.nextOpenSearch || 0)) return false;
+        this.nextOpenSearch = Date.now() + 5000;
+        const origin = this.bot.entity.position;
+        const floors = this.bot.findBlocks({
+            matching: block => block.boundingBox === 'block', maxDistance: 32, count: 24,
+            useExtraInfo: block => !!block?.position && block.position.y >= origin.y + 1 &&
+                this.bot.blockAt(block.position.offset(0, 1, 0))?.name === 'air' &&
+                this.bot.blockAt(block.position.offset(0, 2, 0))?.name === 'air'
+        });
+        floors.sort((a, b) => b.y - a.y);
+        const original = this.bot.pathfinder.movements;
+        const walking = existingPassageMovements(this.bot);
+        for (const floor of floors.slice(0, 12)) {
+            const target = floor.offset(0, 1, 0);
+            if (threatNearPoint(this.bot, target, 3)) continue;
+            const goal = new goals.GoalNear(target.x, target.y, target.z, 1);
+            const route = await planCompletePath(this.bot, goal, 800, walking);
+            if (route.status !== 'success' || threatNearPath(this.bot, route.path)) continue;
+            this.bot.chat('[SpeedBot] Remontee par un passage ouvert, sans creuser.');
+            this.bot.pathfinder.setMovements(walking);
+            try { await withTimeout(this.bot, this.bot.pathfinder.goto(goal), 15000, 'Passage de remontee bloque'); }
+            catch (error) { console.log(`[MoveToSurface] ${error.message}`); }
+            finally { if (this.bot.pathfinder.movements === walking) this.bot.pathfinder.setMovements(original); }
+            return true;
+        }
+        return false;
     }
 
     async doPillarUp(blockItem) {
@@ -179,6 +273,23 @@ class MoveToSurface extends Task {
     }
 
     async equipBestTool(block) {
+        const origin = this.bot.entity.position;
+        const breach = routeThreats(this.bot).find(entity => entity.name === 'creeper' &&
+            entity.position.distanceTo(origin) < 18 && !hasMobAccess(this.bot, origin, entity) &&
+            hasMobAccess(this.bot, origin, entity, [block.position]));
+        if (breach) {
+            this.bot.chat('[SpeedBot] Je ne creuse pas ce bloc : il ouvrirait un passage vers un creeper.');
+            throw new Error('Creusement expose au creeper');
+        }
+        if (/stone|ore|deepslate|granite|diorite|andesite/.test(block.name) &&
+            !this.bot.inventory.items().some(i => i.name.endsWith('_pickaxe'))) {
+            if (!['stone', 'deepslate', 'cobblestone', 'cobbled_deepslate', 'granite', 'diorite', 'andesite'].includes(block.name) && !block.name.endsWith('_ore')) {
+                throw new Error('Bloc trop dur sans pioche');
+            }
+            if (this.bot.heldItem) await this.bot.unequip('hand');
+            console.log(`[MoveToSurface] Sortie de secours : ${block.name} casse a la main, sans drop.`);
+            return;
+        }
         const item = this.bot.pathfinder.bestHarvestTool(block);
         if (item) {
             await this.bot.equip(item, 'hand');
