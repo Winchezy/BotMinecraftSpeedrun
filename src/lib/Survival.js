@@ -7,6 +7,15 @@ const { goals } = require('mineflayer-pathfinder');
 let lastSafePosition = null;
 let lastSafePositionTime = Date.now();
 
+// Cerveau de survie neuronal (initialisé dans setupSurvival)
+let survivalBrain = null;
+try {
+    const { getInstance } = require('./SurvivalBrain');
+    survivalBrain = getInstance();
+} catch (e) {
+    console.log('[Survival] SurvivalBrain non disponible:', e.message);
+}
+
 // Protected blocks (water blockers) that should NEVER be mined
 const protectedBlocks = new Set(); // Store as "x,y,z" strings
 
@@ -55,10 +64,25 @@ function setupSurvival(bot) {
         });
     });
 
+    let isEating = false;
+
     // Health monitoring with auto-eat
     bot.on('health', async () => {
-        if (bot.health < 5) {
+        if (bot.health < 7 && !isEating) {
             console.log(`[Survival] Low health: ${bot.health}/20`);
+
+            // Décision neuronale : manger ou non ?
+            let shouldEat = true;
+            if (survivalBrain) {
+                const neuralDecision = survivalBrain.decide(bot, { recentDamage: true });
+                if (neuralDecision) {
+                    shouldEat = neuralDecision.action === 'EAT_FOOD' || neuralDecision.action === 'DO_NOTHING';
+                    if (!shouldEat) {
+                        console.log(`[SurvivalBrain] Santé faible mais décision: ${neuralDecision.action} → pas de repas`);
+                    }
+                }
+                // Enregistrement pour l'entraînement (règle = manger si nourriture dispo)
+            }
 
             // Try to eat food
             const food = bot.inventory.items().find(item =>
@@ -71,16 +95,28 @@ function setupSurvival(bot) {
                 item.name.includes('potato')
             );
 
-            if (food) {
+            if (food && shouldEat) {
+                const _healthBefore = bot.health;
+                isEating = true;
                 try {
                     console.log(`[Survival] EMERGENCY: Eating ${food.name}!`);
                     await bot.equip(food, 'hand');
-                    bot.activateItem();
-                    await bot.waitForTicks(32); // Wait for eating
-                    bot.deactivateItem();
+
+                    if (bot.consume) {
+                        await bot.consume();
+                    } else {
+                        bot.activateItem();
+                        await bot.waitForTicks(35);
+                        bot.deactivateItem();
+                    }
+                    // Enregistrer seulement si la santé a augmenté
+                    if (survivalBrain && bot.health > _healthBefore) {
+                        survivalBrain.recordSuccess(bot, 'EAT_FOOD', { recentDamage: true });
+                    }
                 } catch (e) {
                     console.log(`[Survival] Failed to eat: ${e.message}`);
                 }
+                isEating = false;
             }
         }
         if (bot.food < 5) {
@@ -99,16 +135,24 @@ function setupSurvival(bot) {
 
     let isInCombat = false;
     let combatTarget = null;
+    let combatStartTime = null;
 
     // React to damage (e.g. being shot by skeleton)
     bot.on('entityHurt', (entity) => {
         if (entity !== bot.entity) return;
 
-        // Find what hurt us (if possible, usually we check nearby mobs)
-        // Mineflayer doesn't always tell us the attacker in this event directly easily,
-        // but we can scan for nearby mobs that are aggro'd.
-        // Actually for projectiles, it's harder.
-        // Let's just trigger a scan with high urgency.
+        // Ignorer si aucun hostile à proximité (ex: dégâts de chute)
+        const hostileNames = ['zombie','skeleton','spider','creeper','enderman','witch',
+            'slime','phantom','drowned','husk','stray','blaze','ghast','magma_cube',
+            'hoglin','piglin_brute','warden','wither_skeleton'];
+        const hasNearbyHostile = !!bot.nearestEntity(e => {
+            if (!e || !e.name || e === bot.entity) return false;
+            const dist = e.position?.distanceTo(bot.entity.position) ?? 99;
+            return dist < 10 && hostileNames.some(h => e.name.toLowerCase().includes(h));
+        });
+
+        if (!hasNearbyHostile) return; // dégâts de chute ou autre cause non-hostile
+
         console.log('[Survival] Ouch! Took damage. Scanning for threats...');
         checkForThreats(true);
     });
@@ -138,18 +182,32 @@ function setupSurvival(bot) {
                 return distance < 16;
             });
 
+            // Timeout de sécurité : reset combat après 12s sans résolution
+            if (isInCombat && combatStartTime && Date.now() - combatStartTime > 12000) {
+                console.log('[Survival] Combat timeout — reset forcé.');
+                isInCombat    = false;
+                combatTarget  = null;
+                combatStartTime = null;
+                try { bot.pvp.stop(); } catch (e) {}
+            }
+
             if (nearbyHostile) {
-                console.log(`[Survival] THREAT DETECTED: ${nearbyHostile.name} at distance ${bot.entity.position.distanceTo(nearbyHostile.position).toFixed(1)}`);
+                if (!isInCombat || combatTarget !== nearbyHostile) {
+                    console.log(`[Survival] THREAT DETECTED: ${nearbyHostile.name} at distance ${bot.entity.position.distanceTo(nearbyHostile.position).toFixed(1)}`);
+                }
                 await handleThreat(bot, nearbyHostile, urgent);
             } else {
                 if (isInCombat) {
-                    if (!combatTarget || !combatTarget.isValid || bot.entity.position.distanceTo(combatTarget.position) > 20) {
-                        isInCombat = false;
-                        combatTarget = null;
+                    if (!combatTarget || !combatTarget.isValid || bot.entity.position.distanceTo(combatTarget.position) > 16) {
+                        isInCombat    = false;
+                        combatTarget  = null;
+                        combatStartTime = null;
                         bot.pvp.stop();
                         bot.pathfinder.stop();
-                        console.log('[Survival] Combat threat cleared/lost. Resuming duties.');
-                        bot.chat("[Survival] Threat cleared.");
+                        // N'annoncer que si le bot est encore vivant (pas une mort/respawn)
+                        if (bot.health > 0) {
+                            console.log('[Survival] Combat threat cleared/lost. Resuming duties.');
+                        }
                     } else {
                         try { bot.pvp.attack(combatTarget); } catch (e) { }
                     }
@@ -163,10 +221,34 @@ function setupSurvival(bot) {
     // Helper to keep code clean and fix nesting
     async function handleThreat(bot, nearbyHostile, urgent) {
         if (!isInCombat || combatTarget !== nearbyHostile) {
-            const isRanged = nearbyHostile.name.includes('skeleton') || nearbyHostile.name.includes('witch') || nearbyHostile.name.includes('blaze');
+            const isRanged    = nearbyHostile.name.includes('skeleton') || nearbyHostile.name.includes('witch') || nearbyHostile.name.includes('blaze');
             const isExplosive = nearbyHostile.name.includes('creeper');
-            const hasWeapon = await equipBestWeapon(bot);
-            let safeToFight = true;
+            const hasWeapon   = await equipBestWeapon(bot);
+            let safeToFight   = true;
+
+            // ── Décision neuronale ────────────────────────────────────────────
+            if (survivalBrain) {
+                const ctx = { recentDamage: urgent };
+                const neuralDecision = survivalBrain.decide(bot, ctx);
+                if (neuralDecision) {
+                    const { action } = neuralDecision;
+                    if (action === 'FIGHT') {
+                        isInCombat    = true;
+                        combatTarget  = nearbyHostile;
+                        console.log(`[SurvivalBrain] COMBAT → ${nearbyHostile.name}`);
+                        bot.pathfinder.stop();
+                        bot.pvp.stop();
+                        try { bot.pvp.attack(nearbyHostile); } catch (e) { bot.attack(nearbyHostile); }
+                        return;
+                    } else if (action === 'FLEE') {
+                        console.log(`[SurvivalBrain] FUITE → ${nearbyHostile.name}`);
+                        await retreat(bot, nearbyHostile);
+                        return;
+                    }
+                    // DO_NOTHING ou autre → les règles prennent la relève
+                }
+            }
+            // ─────────────────────────────────────────────────────────────────
 
             const nearbyEntities = Object.values(bot.entities).filter(e =>
                 e.type === 'mob' &&
@@ -219,8 +301,9 @@ function setupSurvival(bot) {
             }
 
             if (safeToFight) {
-                isInCombat = true;
-                combatTarget = nearbyHostile;
+                isInCombat      = true;
+                combatTarget    = nearbyHostile;
+                combatStartTime = Date.now();
                 const msg = `[Survival] Engaging ${nearbyHostile.name}`;
                 console.log(msg);
                 bot.chat(msg);
@@ -238,12 +321,39 @@ function setupSurvival(bot) {
                     }
                 }
 
-                try { bot.pvp.attack(nearbyHostile); } catch (e) { bot.attack(nearbyHostile); }
+                const _healthBeforeFight = bot.health ?? 20;
+                try {
+                    bot.pvp.attack(nearbyHostile);
+                } catch (e) {
+                    // Fallback : naviguer vers la cible puis attaquer manuellement
+                    console.log(`[Survival] pvp.attack échoué (${e.message}), fallback manuel.`);
+                    const { goals } = require('mineflayer-pathfinder');
+                    bot.pathfinder.setGoal(new goals.GoalFollow(nearbyHostile, 2), true);
+                }
+                // Enregistrement récompense : succès si la cible n'existe plus après 3s
+                if (survivalBrain) {
+                    const _fightTarget = nearbyHostile;
+                    setTimeout(() => {
+                        const stillAlive = bot.entities[_fightTarget.id];
+                        if (!stillAlive) survivalBrain.recordSuccess(bot, 'FIGHT', { recentDamage: urgent });
+                    }, 3000);
+                }
             } else {
                 if (isInCombat || urgent || nearbyHostile.position.distanceTo(bot.entity.position) < 15) {
                     console.log(`[Survival] Active Retreat from ${nearbyHostile.name}`);
+                    const _healthBeforeFlee = bot.health ?? 20;
                     await retreat(bot, nearbyHostile);
+                    // Enregistrement récompense : succès si santé préservée après fuite
+                    if (survivalBrain && (bot.health ?? 20) >= _healthBeforeFlee) {
+                        survivalBrain.recordSuccess(bot, 'FLEE', { recentDamage: urgent });
+                    }
                 }
+            }
+        } else {
+            // Already in combat with this target. Refresh the attack state if needed,
+            // occasionally bot gets stuck because pathfinder got interrupted.
+            if (Date.now() % 2000 < 500) { // Refresh every ~2 seconds
+               try { bot.pvp.attack(nearbyHostile); } catch(e) {}
             }
         }
     }
@@ -316,6 +426,7 @@ function setupSurvival(bot) {
     let lastPosition = null;
     let lastMoveTime = Date.now();
     let stuckOnLandTicks = 0;
+    let survivalForcedJump = false; // ne relâcher jump que si c'est nous qui l'avons forcé
 
 
     bot.on('physicsTick', async () => {
@@ -333,11 +444,15 @@ function setupSurvival(bot) {
             (headBlock && headBlock.name.includes('water'));
 
         // 1. LAND STUCK DETECTION (If attempting to move but position not changing)
-        if (bot.pathfinder.isMoving() && !inWater) {
+        // Ne pas interférer si le bot mine, collecte, interagit ou pose un bloc
+        // (isBuilding: le pathfinder maintient jump pour poser un bloc sous ses pieds)
+        const isBusy = bot.targetDigBlock || bot.isSleeping ||
+            (typeof bot.pathfinder.isBuilding === 'function' && bot.pathfinder.isBuilding());
+        if (bot.pathfinder.isMoving() && !inWater && !isBusy) {
             const currentPos = bot.entity.position;
             if (lastPosition) {
                 const dist = currentPos.distanceTo(lastPosition);
-                if (dist < 0.2) { // Moved less than 0.2 blocks in ~300ms
+                if (dist < 0.1) { // Seuil réduit : 0.1 bloc en 300ms
                     stuckOnLandTicks++;
                 } else {
                     stuckOnLandTicks = 0;
@@ -347,38 +462,78 @@ function setupSurvival(bot) {
                 lastPosition = currentPos.clone();
             }
 
-            if (stuckOnLandTicks > 5) { // Stuck for ~1.5 seconds
-                console.log(`[Survival] Stuck on land (diagonal/block)? JUMPING to unstuck.`);
+            if (stuckOnLandTicks > 15) { // ~4.5 secondes avant de réagir (était 1.5s)
+                if (stuckOnLandTicks % 10 === 0) { // Log seulement toutes les ~3 secondes
+                    console.log(`[Survival] Stuck on land for ${(stuckOnLandTicks * 0.3).toFixed(1)}s. Trying to unstuck.`);
+                }
                 bot.setControlState('jump', true);
-                bot.setControlState('sprint', false);
+                survivalForcedJump = true;
 
                 // If really stuck, strafe slightly
-                if (stuckOnLandTicks > 10) {
+                if (stuckOnLandTicks > 25) {
                     const strafeState = Math.random() > 0.5 ? 'left' : 'right';
                     bot.setControlState(strafeState, true);
                     setTimeout(() => bot.setControlState(strafeState, false), 500);
                 }
 
-                // If EXTREMELY stuck, stop pathfinder to verify path
-                if (stuckOnLandTicks > 20) {
+                // If EXTREMELY stuck, stop pathfinder to recalculate
+                if (stuckOnLandTicks > 40) {
                     console.log(`[Survival] EXTREMELY stuck. Resetting pathfinder.`);
                     bot.pathfinder.stop();
                     stuckOnLandTicks = 0;
                 }
             } else {
-                // Reset jump if we were stuck but now moving (unless water)
-                if (!inWater) bot.setControlState('jump', false);
+                // Ne relâcher jump que si c'est Survival qui l'a forcé,
+                // sinon on coupe les sauts du pathfinder (towering, parkour)
+                if (!inWater && survivalForcedJump) {
+                    bot.setControlState('jump', false);
+                    survivalForcedJump = false;
+                }
+            }
+        } else {
+            // Reset si on n'est plus en déplacement (on mine, on collecte, etc.)
+            if (stuckOnLandTicks > 0) stuckOnLandTicks = 0;
+            if (survivalForcedJump && !inWater) {
+                bot.setControlState('jump', false);
+                survivalForcedJump = false;
             }
         }
 
         if (inWater) {
-            // ... existing water logic ...
-
             inWaterTicks++;
 
             // Always jump AND sprint when in water to escape currents
             bot.setControlState('jump', true);
             bot.setControlState('sprint', true);
+
+            // ── Décision neuronale pour l'échappement de l'eau ───────────────
+            if (survivalBrain && inWaterTicks > 5 && inWaterTicks % 5 === 0) {
+                const neuralDecision = survivalBrain.decide(bot, {});
+                if (neuralDecision) {
+                    const { action } = neuralDecision;
+                    if (action === 'JUMP_SWIM') {
+                        // Déjà géré (jump+sprint), enregistrement si on sort de l'eau
+                        const _inWaterBefore = inWaterTicks;
+                        setTimeout(() => {
+                            const posNow = bot.entity?.position;
+                            if (!posNow) return;
+                            const feetNow = bot.blockAt(posNow.floored());
+                            const headNow = bot.blockAt(posNow.offset(0, 1.6, 0).floored());
+                            const stillInWater = (feetNow?.name?.includes('water')) || (headNow?.name?.includes('water'));
+                            if (!stillInWater) survivalBrain.recordSuccess(bot, 'JUMP_SWIM', {});
+                        }, 2000);
+                    } else if (action === 'BLOCK_WATER' && escapeAttempts <= 3) {
+                        // Forcer la stratégie de blocage d'eau plus tôt
+                        console.log('[SurvivalBrain] → Priorité au blocage d\'eau');
+                        escapeAttempts = 4; // Déclenche la stratégie de blocage
+                    } else if (action === 'FIND_LAND' && escapeAttempts < 26) {
+                        // Passer directement à la recherche de terre ferme
+                        console.log('[SurvivalBrain] → Priorité à la recherche de terre');
+                        escapeAttempts = 26;
+                    }
+                }
+            }
+            // ─────────────────────────────────────────────────────────────────
 
             if (inWaterTicks > 5) {
                 escapeAttempts++;
@@ -447,6 +602,17 @@ function setupSurvival(bot) {
                                 if (referenceBlock && referenceBlock.name !== 'air') {
                                     await bot.placeBlock(referenceBlock, new (require('vec3'))(0, 1, 0));
                                     console.log('[Survival] Water block placed! Current should stop.');
+                                    // Enregistrement récompense : succès si on n'est plus dans l'eau après 2s
+                                    if (survivalBrain) {
+                                        setTimeout(() => {
+                                            const posNow = bot.entity?.position;
+                                            if (!posNow) return;
+                                            const feetNow = bot.blockAt(posNow.floored());
+                                            const headNow = bot.blockAt(posNow.offset(0, 1.6, 0).floored());
+                                            const stillInWater = (feetNow?.name?.includes('water')) || (headNow?.name?.includes('water'));
+                                            if (!stillInWater) survivalBrain.recordSuccess(bot, 'BLOCK_WATER', {});
+                                        }, 2000);
+                                    }
 
                                     // CRITICAL: Blacklist this block to NEVER mine it
                                     const blockKey = `${placePos.x},${placePos.y},${placePos.z}`;
@@ -614,8 +780,13 @@ function setupSurvival(bot) {
                 console.log('[Survival] Escaped from water!');
                 escapeAttempts = 0;
             }
+            // Ne relâcher jump qu'à la sortie de l'eau (c'est la nage qui l'avait forcé).
+            // Le faire à chaque tick écrase les sauts du pathfinder (towering, parkour).
+            if (inWaterTicks > 0) {
+                bot.setControlState('jump', false);
+                bot.setControlState('sprint', false);
+            }
             inWaterTicks = 0;
-            bot.setControlState('jump', false);
         }
     });
 
@@ -934,16 +1105,19 @@ function configurePathfinder(bot) {
     movements.dontCreateFlow = true;
     movements.dontMineUnderFallingBlock = true;
 
+    // IDs d'ITEMS (pas de blocs) : le pathfinder compare à item.type dans l'inventaire
     movements.scafoldingBlocks = [
-        mcData.blocksByName.cobblestone?.id,
-        mcData.blocksByName.dirt?.id,
-        mcData.blocksByName.netherrack?.id
-    ];
+        mcData.itemsByName.cobblestone?.id,
+        mcData.itemsByName.dirt?.id,
+        mcData.itemsByName.netherrack?.id
+    ].filter(id => id !== undefined);
 
-    // Protect Crafting Table
+    // Protect Crafting Table and Furnace
     if (mcData.blocksByName.crafting_table) {
         movements.blocksCantBreak.add(mcData.blocksByName.crafting_table.id);
-        movements.safeToBreak = (block) => block.type !== mcData.blocksByName.crafting_table.id;
+    }
+    if (mcData.blocksByName.furnace) {
+        movements.blocksCantBreak.add(mcData.blocksByName.furnace.id);
     }
 
     // Strongly avoid water - treat it as if it's a solid wall
@@ -964,8 +1138,8 @@ function configurePathfinder(bot) {
     movements.safeToBreak = function (block) {
         if (!block) return false;
 
-        // Never consider crafting table safe to break
-        if (block.name === 'crafting_table') return false;
+        // Never consider crafting table or furnace safe to break
+        if (block.name === 'crafting_table' || block.name === 'furnace') return false;
 
         // Never consider water or lava safe to break/walk through
         if (block.name === 'water' || block.name === 'lava') {
@@ -975,8 +1149,17 @@ function configurePathfinder(bot) {
         return originalSafeToBreak ? originalSafeToBreak.call(this, block) : true;
     };
 
+    // Patch: protéger safeOrBreak contre les blocs dans des chunks non chargés (block.digTime undefined)
+    const originalSafeOrBreak = movements.safeOrBreak;
+    if (originalSafeOrBreak) {
+        movements.safeOrBreak = function(block, ...args) {
+            if (!block || typeof block.digTime !== 'function') return 0;
+            return originalSafeOrBreak.call(this, block, ...args);
+        };
+    }
+
     bot.pathfinder.setMovements(movements);
-    console.log('[Survival] Pathfinder configured: avoid water/lava completely, no digging under feet, preserve tables');
+    console.log('[Survival] Pathfinder configured: avoid water/lava completely, no digging under feet, preserve tables/furnaces');
 }
 
 module.exports = { setupSurvival, configurePathfinder, protectedBlocks };

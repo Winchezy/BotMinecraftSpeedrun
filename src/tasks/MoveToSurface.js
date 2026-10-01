@@ -1,11 +1,21 @@
 const Task = require('../lib/Task');
 
+// Cerveau neuronal partagé pour les décisions de remontée
+let movementBrain = null;
+try {
+    const { getInstance } = require('../lib/MovementBrain');
+    movementBrain = getInstance();
+} catch (e) { /* Pas de cerveau, on utilise les règles */ }
+
 class MoveToSurface extends Task {
     constructor(bot) {
         super(bot);
-        this.name = 'MoveToSurface';
-        this.mcData = require('minecraft-data')(bot.version);
+        this.name    = 'MoveToSurface';
+        this.mcData  = require('minecraft-data')(bot.version);
         this.attempts = 0;
+        this.startY  = bot.entity ? bot.entity.position.y : null;
+        this._digFailures  = 0;   // échecs consécutifs de dig
+        this._lastDigBlock = null; // clé du dernier bloc tenté
     }
 
     async run() {
@@ -20,12 +30,10 @@ class MoveToSurface extends Task {
 
         const pos = this.bot.entity.position;
 
-        // Check if we're already at surface (y > 62 AND sky accessible)
-        const blockAtHead = this.bot.blockAt(pos.offset(0, 2, 0));
-        const skyLight = blockAtHead ? blockAtHead.skyLight : 0;
-
-        if (pos.y > 62 && skyLight >= 14) {
-            console.log(`[MoveToSurface] Reached surface! (Y: ${pos.y}, SkyLight: ${skyLight})`);
+        // Y > 62 suffit — pas de dépendance skyLight (faux négatifs la nuit / zones couvertes)
+        if (pos.y > 62) {
+            console.log(`[MoveToSurface] Reached surface! (Y: ${pos.y.toFixed(1)})`);
+            if (movementBrain) movementBrain.saveAll();
             this.complete();
             return;
         }
@@ -42,22 +50,84 @@ class MoveToSurface extends Task {
 
         if (this.stuckCount > 20) {
             console.log("[MoveToSurface] STUCK at same Y for too long. Moving randomly.");
-            await this.doStaircaseUp(pos); // Use staircase to move sideways/up
+            const _yBeforeStuck = pos.y;
+            await this.doStaircaseUp(pos);
+            if (movementBrain) movementBrain.recordSurfaceSuccess(this.bot, 'STAIRCASE_UP', this.stuckCount, this.startY, _yBeforeStuck);
             this.stuckCount = 0;
             return;
         }
 
-        // STRATEGY SELECTION
+        // ── Sélection de stratégie (neuronale ou règles) ──────────────────────
         const placeableItems = this.bot.inventory.items().filter(i =>
             i.name === 'cobblestone' || i.name === 'dirt' || i.name === 'stone' ||
             i.name === 'netherrack' || i.name === 'andesite' || i.name === 'diorite' ||
             i.name === 'granite' || i.name.includes('planks') || i.name.includes('log')
         );
 
-        if (placeableItems.length > 0) {
-            await this.doPillarUp(placeableItems[0]);
+        // Décision neuronale
+        if (movementBrain) {
+            const neuralDecision = movementBrain.decideSurfaceAction(
+                this.bot, this.stuckCount ?? 0, this.startY
+            );
+            if (neuralDecision) {
+                const { action } = neuralDecision;
+                if (action === 'PILLAR_UP' && placeableItems.length > 0) {
+                    await this.doPillarUp(placeableItems[0]);
+                    return;
+                } else if (action === 'DIG_CEILING') {
+                    const blockAboveHead = this.bot.blockAt(pos.offset(0, 2, 0));
+                    if (blockAboveHead && blockAboveHead.boundingBox === 'block') {
+                        await this.equipBestTool(blockAboveHead);
+                        await this.bot.dig(blockAboveHead);
+                        return;
+                    }
+                } else if (action === 'STAIRCASE_UP' || action === 'DIG_FORWARD') {
+                    await this.doStaircaseUp(pos);
+                    return;
+                } else if (action === 'STOP') {
+                    this.complete();
+                    return;
+                }
+                // Action non applicable → règles prennent la relève
+            }
+        }
+
+        // Règles de fallback + enregistrement reward-based
+        const _yBeforeFallback = pos.y;
+        const blockAboveHead = this.bot.blockAt(pos.offset(0, 2, 0));
+        const ceilingBlocked = !!(blockAboveHead && blockAboveHead.boundingBox === 'block');
+
+        // Si le même bloc de plafond échoue 3 fois de suite → forcer staircase
+        const ceilKey = blockAboveHead ? `${blockAboveHead.position.x},${blockAboveHead.position.y},${blockAboveHead.position.z}` : null;
+        if (ceilKey && ceilKey === this._lastDigBlock) {
+            this._digFailures++;
         } else {
-            await this.doStaircaseUp(pos);
+            this._digFailures = 0;
+            this._lastDigBlock = ceilKey;
+        }
+        const forceStaircase = this._digFailures >= 3;
+
+        if (!forceStaircase && placeableItems.length > 0) {
+            if (ceilingBlocked) {
+                await this.doPillarUp(placeableItems[0]); // va creuser le plafond
+                if (movementBrain) movementBrain.recordSurfaceSuccess(this.bot, 'DIG_CEILING', this.stuckCount ?? 0, this.startY, _yBeforeFallback);
+            } else {
+                await this.doPillarUp(placeableItems[0]); // va pillar
+                if (movementBrain) movementBrain.recordSurfaceSuccess(this.bot, 'PILLAR_UP', this.stuckCount ?? 0, this.startY, _yBeforeFallback);
+            }
+        } else {
+            if (forceStaircase) {
+                console.log(`[MoveToSurface] Dig sur même bloc échoué ${this._digFailures}x → forcé STAIRCASE`);
+                this._digFailures = 0;
+                this._lastDigBlock = null;
+            }
+            if (ceilingBlocked) {
+                await this.doStaircaseUp(pos);
+                if (movementBrain) movementBrain.recordSurfaceSuccess(this.bot, 'DIG_FORWARD', this.stuckCount ?? 0, this.startY, _yBeforeFallback);
+            } else {
+                await this.doStaircaseUp(pos);
+                if (movementBrain) movementBrain.recordSurfaceSuccess(this.bot, 'STAIRCASE_UP', this.stuckCount ?? 0, this.startY, _yBeforeFallback);
+            }
         }
     }
 
@@ -169,13 +239,16 @@ class MoveToSurface extends Task {
         }
 
         // Should be clear to move/jump
-        this.bot.setControlState('sprint', true);
-        this.bot.setControlState('jump', true);
-        this.bot.setControlState('forward', true);
-        await this.bot.waitForTicks(15);
-        this.bot.setControlState('jump', false);
-        this.bot.setControlState('forward', false);
-        this.bot.setControlState('sprint', false);
+        try {
+            this.bot.setControlState('sprint', true);
+            this.bot.setControlState('jump', true);
+            this.bot.setControlState('forward', true);
+            await this.bot.waitForTicks(15);
+        } finally {
+            this.bot.setControlState('jump', false);
+            this.bot.setControlState('forward', false);
+            this.bot.setControlState('sprint', false);
+        }
     }
 
     async equipBestTool(block) {

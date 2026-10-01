@@ -161,11 +161,11 @@ class SmeltTask extends Task {
             const above = pos.offset(0, 1, 0);
             const blockAbove = this.bot.blockAt(above);
 
-            // Check if space above is clear
-            if (blockAbove && blockAbove.type === this.mcData.blocksByName.air.id) {
-                // Ensure bot is not standing in the way (check distance to center of placement)
+            // Check if space above is clear (air or replaceable plant)
+            if (blockAbove && (blockAbove.name.includes('air') || blockAbove.name.includes('grass') || blockAbove.name.includes('fern') || blockAbove.name.includes('snow'))) {
+                // Ensure bot is not standing in the way
                 const centerAbove = above.offset(0.5, 0.5, 0.5);
-                if (this.bot.entity.position.distanceTo(centerAbove) > 2.0) {
+                if (this.bot.entity.position.distanceTo(centerAbove) > 1.3) {
                     try {
                         console.log(`[SmeltTask] Attempting to place furnace at ${above}`);
                         await this.bot.equip(furnaceItem, 'hand');
@@ -175,11 +175,21 @@ class SmeltTask extends Task {
                         return;
                     } catch (err) {
                         console.log(`[SmeltTask] Failed to place furnace at ${above}: ${err.message}`);
-                        // Continue to next spot
                     }
                 }
             }
         }
+        
+        // If still failed, just try to place it right at our feet (minus 1)
+        console.log(`[SmeltTask] Strict placement failed, trying fallback placement...`);
+        const fallbackPos = this.bot.entity.position.floored().offset(1, 0, 0);
+        try {
+            await this.bot.equip(furnaceItem, 'hand');
+            await this.bot.placeBlock(this.bot.blockAt(fallbackPos.offset(0, -1, 0)), new Vec3(0, 1, 0));
+            console.log(`[SmeltTask] Fallback furnace placed.`);
+            return;
+        } catch(e) {}
+
         throw new Error("Could not find a valid spot to place furnace");
     }
 }

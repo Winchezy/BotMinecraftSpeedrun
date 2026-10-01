@@ -46,6 +46,7 @@ class MineBlock extends Task {
                 if (this.blockName === 'iron_ore' && i.name === 'raw_iron') return true;
                 if (this.blockName === 'gold_ore' && i.name === 'raw_gold') return true;
                 if (this.blockName === 'copper_ore' && i.name === 'raw_copper') return true;
+                if (this.blockName === 'coal_ore' && i.name === 'coal') return true;
                 if (this.blockName === 'stone') {
                     if (i.name === 'cobblestone') return true;
                     if (i.name === 'cobbled_deepslate') return true;
@@ -210,10 +211,17 @@ class MineBlock extends Task {
                 // Better: Just pick a spot 2 blocks away at same Y level
                 if (isBelow) {
                     console.log(`[${this.name}] Block is below. Moving to side to mine safely.`);
-                    const sidePos = block.position.offset(1, 1, 0); // Up and side
-                    // Check if sidePos is safe?
-                    // Just use pathfinder to go near it but NOT on it.
-                    await this.bot.pathfinder.goto(new goals.GoalNear(block.position.x, this.bot.entity.position.y, block.position.z, 2.5));
+                    try {
+                        await Promise.race([
+                            this.bot.pathfinder.goto(new goals.GoalNear(block.position.x, this.bot.entity.position.y, block.position.z, 2.5)),
+                            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 8000))
+                        ]);
+                    } catch (e) {
+                        console.log(`[${this.name}] Impossible d'atteindre le côté du bloc (${e.message}). Blacklist.`);
+                        const posKey = `${block.position.x},${block.position.y},${block.position.z}`;
+                        failedBlockPositions.set(posKey, this.maxBlockFailures);
+                        return;
+                    }
                 } else {
                     await this.bot.pathfinder.goto(goal);
                 }
@@ -282,7 +290,9 @@ class MineBlock extends Task {
                             return false;
                         }
                         return i.name.includes(this.blockName) ||
-                            (this.blockName === 'stone' && i.name === 'cobblestone');
+                            (this.blockName === 'stone' && i.name === 'cobblestone') ||
+                            (this.blockName === 'coal_ore' && i.name === 'coal') ||
+                            (this.blockName === 'iron_ore' && i.name === 'raw_iron');
                     })
                     .reduce((a, b) => a + b.count, 0);
 

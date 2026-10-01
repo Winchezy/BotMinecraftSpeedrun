@@ -7,6 +7,9 @@ const BuildNetherPortal = require('./tasks/BuildNetherPortal');
 const FindStronghold = require('./tasks/FindStronghold');
 const FightDragon = require('./tasks/FightDragon');
 const MoveToSurface = require('./tasks/MoveToSurface');
+const LocalBrain = require('./LocalBrain');
+const fs = require('fs');
+const path = require('path');
 
 class Agent {
     constructor(bot) {
@@ -15,6 +18,10 @@ class Agent {
         this.mcData = require('minecraft-data')(bot.version);
         this.stage = 'EARLY_GAME'; // EARLY_GAME, IRON, DIAMOND, NETHER, STRONGHOLD, END
         this.failedTasks = {}; // Track failed tasks to avoid infinite loops
+        this._redundancyAttempts = 0; // Limite les tentatives de craft de pioche de secours
+        this._pendingRecord = null; // Reward-based recording: état avant la tâche en cours
+
+        this.brain = new LocalBrain();
 
         // Chat Listener for Status Updates
         this.bot.on('chat', (username, message) => {
@@ -48,18 +55,12 @@ class Agent {
             return;
         }
 
-        if (this.currentTask) {
-            console.log(`[DEBUG] Tick: Current task is ${this.currentTask.name}, done=${this.currentTask.isDone()}`);
-        } else {
-            console.log(`[DEBUG] Tick: No current task`);
-        }
-
+        // Si une tâche est en cours, la laisser finir
         if (this.currentTask && !this.currentTask.isDone()) {
             try {
                 await this.currentTask.run();
             } catch (err) {
                 console.log(`Task Error: ${err.message}`);
-                // Track failed tasks
                 const taskName = this.currentTask.name;
                 this.failedTasks[taskName] = (this.failedTasks[taskName] || 0) + 1;
                 this.currentTask = null;
@@ -67,40 +68,205 @@ class Agent {
             return;
         }
 
-        // If current task is done, check if it failed
+        // Tâche terminée, on la nettoie
         if (this.currentTask && this.currentTask.isDone()) {
             if (this.currentTask.hasFailed) {
                 const taskName = this.currentTask.name;
                 this.failedTasks[taskName] = (this.failedTasks[taskName] || 0) + 1;
+                this._pendingRecord = null; // Échec → on ne garde pas l'exemple
+            } else if (this._pendingRecord) {
+                this._saveProgressionExample(this._pendingRecord.actionName, this._pendingRecord.input);
+                this._pendingRecord = null;
             }
             this.currentTask = null;
         }
 
-        this.decideNext();
-    }
-
-    async decideNext() {
-        // Check if bot is in water - if so, wait for survival system to get us out
-        // Check if bot is in water - if so, wait for survival system to get us out
-        /*
-        const pos = this.bot.entity.position;
-        const feetBlock = this.bot.blockAt(pos.floored());
-        const headBlock = this.bot.blockAt(pos.offset(0, 1.6, 0).floored());
-
-        const inWater = (feetBlock && feetBlock.name.includes('water')) ||
-            (headBlock && headBlock.name.includes('water'));
-
-        if (inWater) {
-            console.log('[Agent] Waiting for bot to escape water before starting new tasks...');
-            await this.bot.waitForTicks(20);
-            return;
-        }
-        */
-
         const inv = this.bot.inventory.items();
         const summary = inv.map(i => `${i.name}x${i.count}`).join(', ');
+
+        // --- ÉTAPE 1 : La state machine décide ---
         console.log(`[Agent] Stage: ${this.stage} | Inventory: ${summary.substring(0, 100)}...`);
 
+        // Capturer l'état AVANT la décision (pour l'entraînement par récompense)
+        let _stateBeforeDecision = null;
+        try {
+            const { encodeState } = require('./Recorder');
+            _stateBeforeDecision = encodeState(this.bot);
+        } catch (e) {}
+
+        // On sauvegarde l'état avant la state machine
+        const hadTask = !!this.currentTask;
+        await this.runStateMachine(inv, summary);
+
+        // Si une nouvelle tâche a été assignée, préparer l'enregistrement récompense
+        if (this.currentTask && !this._pendingRecord && _stateBeforeDecision) {
+            const actionName = this._inferActionName(this.currentTask);
+            if (actionName) {
+                this._pendingRecord = { input: _stateBeforeDecision, actionName };
+            }
+        }
+
+        // Si la state machine a assigné une tâche, on l'exécute
+        if (this.currentTask) return;
+
+        // --- ÉTAPE 2 : La state machine n'a rien proposé, on consulte le Brain ---
+        this.ticksSinceLastAiCheck = (this.ticksSinceLastAiCheck || 0) + 1;
+
+        // Détection de stuck réelle : même stage depuis trop longtemps
+        const consecutiveFailures = Object.values(this.failedTasks).reduce((a, b) => a + b, 0);
+        const isStuck = consecutiveFailures > 5;
+
+        if (isStuck || this.ticksSinceLastAiCheck > 100) {
+            this.ticksSinceLastAiCheck = 0;
+
+            const botState = {
+                _bot: this.bot,
+                stage: this.stage,
+                failedTasks: JSON.stringify(this.failedTasks),
+                isStuck: isStuck
+            };
+
+            const aiDecision = await this.brain.decideNextTask(botState);
+            if (aiDecision && this.validateAiCommand(aiDecision)) {
+                console.log(`[Agent-IA] Conseil IA accepté: ${aiDecision.action}`, aiDecision.args);
+                try { this.bot.pathfinder.setGoal(null); } catch (e) {}
+                this.bot.clearControlStates();
+                this.executeAiCommand(aiDecision);
+            }
+        }
+
+    }
+
+    // ==================== REWARD-BASED RECORDING ====================
+
+    // Déduit le nom de l'action ACTIONS[] depuis l'instance de tâche
+    _inferActionName(task) {
+        const n = task.name;
+        if (n === 'GetWood')       return 'GetWood';
+        if (n === 'MoveToSurface') return 'MoveToSurface';
+        if (n === 'DigDown')       return 'DigDown';
+
+        if (n.startsWith('Mine_')) {
+            const b = task.blockName || '';
+            if (b.includes('iron'))    return 'MineIronOre';
+            if (b.includes('coal'))    return 'MineCoal';
+            if (b.includes('diamond')) return 'DigDown';
+            if (b.includes('stone') || b.includes('cobble')) return 'MineStone';
+            if (b.includes('obsidian')) return 'MineObsidian';
+            if (b.includes('gravel'))  return 'MineGravel';
+        }
+
+        if (n.startsWith('Craft_') || n.startsWith('Smelt_')) {
+            const item = task.itemName || task.outputItem || '';
+            if (item.includes('planks'))         return 'CraftPlanks';
+            if (item === 'crafting_table')        return 'CraftCraftingTable';
+            if (item === 'stick')                 return 'CraftStick';
+            if (item === 'wooden_pickaxe')        return 'CraftWoodenPickaxe';
+            if (item === 'stone_pickaxe')         return 'CraftStonePickaxe';
+            if (item === 'stone_sword')           return 'CraftStoneSword';
+            if (item === 'furnace')               return 'CraftFurnace';
+            if (item === 'iron_pickaxe')          return 'CraftIronPickaxe';
+            if (item === 'iron_sword')            return 'CraftIronSword';
+            if (item === 'iron_ingot')            return 'SmeltIron';
+            if (item === 'flint_and_steel')       return 'CraftFlintAndSteel';
+            if (item === 'blaze_powder')          return 'CraftBlazePowder';
+            if (item === 'ender_eye')             return 'CraftEyeOfEnder';
+        }
+
+        if (n === 'FightMob') {
+            const mob = task.mobType || '';
+            if (mob === 'blaze')    return 'FightBlaze';
+            if (mob === 'enderman') return 'FightEnderman';
+        }
+
+        return null;
+    }
+
+    _saveProgressionExample(actionName, input) {
+        try {
+            const { ACTIONS } = require('./Recorder');
+            const datasetPath = require('path').join(__dirname, '../data/dataset.json');
+            const idx = ACTIONS.indexOf(actionName);
+            if (idx === -1) return;
+            const output = new Array(ACTIONS.length).fill(0);
+            output[idx] = 1;
+            let dataset = [];
+            if (require('fs').existsSync(datasetPath)) {
+                dataset = JSON.parse(require('fs').readFileSync(datasetPath, 'utf-8'));
+            }
+            dataset.push({ input, output, action: actionName, reward: 1, timestamp: Date.now() });
+            const tmp = datasetPath + '.tmp';
+            require('fs').writeFileSync(tmp, JSON.stringify(dataset, null, 2));
+            require('fs').renameSync(tmp, datasetPath);
+            console.log(`[Agent] Récompense enregistrée: ${actionName} (total: ${dataset.length})`);
+        } catch (e) {
+            console.log(`[Agent] Erreur enregistrement récompense: ${e.message}`);
+        }
+    }
+
+    // ==================== SURFACE CHECK ====================
+
+    /**
+     * Retourne une chaîne décrivant la raison de remonter à la surface,
+     * ou null si le bot peut rester où il est.
+     * N'est pas appelé pour NETHER, STRONGHOLD, END (underground intentionnel).
+     */
+    _requiresSurface(inv, has, count) {
+        if (['NETHER', 'STRONGHOLD', 'END'].includes(this.stage)) return null;
+
+        const y = this.bot.entity.position.y;
+        if (y >= 60) return null; // déjà en surface
+
+        // ── EARLY_GAME : pas de bois et pas d'arbre accessible à portée ─────────
+        if (this.stage === 'EARLY_GAME') {
+            const hasWood = inv.some(i => i.name.includes('log') || i.name.includes('planks'));
+            if (!hasWood) {
+                const treeNearby = this.bot.findBlock({
+                    matching: b => b.name.includes('log') && !b.name.includes('stripped'),
+                    maxDistance: 24
+                });
+                if (!treeNearby) return 'early_game_no_wood_underground';
+            }
+        }
+
+        // ── IRON : du raw_iron à fondre mais pas de fourneau à portée ───────────
+        if (this.stage === 'IRON') {
+            const rawIron = inv.filter(i => i.name === 'raw_iron').reduce((a, b) => a + b.count, 0);
+            if (rawIron >= 3) {
+                const furnace = this.bot.findBlock({
+                    matching: this.mcData.blocksByName.furnace?.id,
+                    maxDistance: 32
+                });
+                if (!furnace) return 'iron_raw_iron_no_furnace';
+            }
+
+            // Ingots en main + besoin de crafter mais pas de table à portée
+            if (count('iron_ingot') >= 3 && !has('iron_pickaxe')) {
+                const table = this.bot.findBlock({
+                    matching: this.mcData.blocksByName.crafting_table?.id,
+                    maxDistance: 32
+                });
+                if (!table) return 'iron_craft_no_table';
+            }
+        }
+
+        // ── DIAMOND : diamants en main, pioche non craftée, pas de table à portée
+        if (this.stage === 'DIAMOND') {
+            const diamonds = inv.filter(i => i.name === 'diamond').reduce((a, b) => a + b.count, 0);
+            if (diamonds >= 3 && !has('diamond_pickaxe')) {
+                const table = this.bot.findBlock({
+                    matching: this.mcData.blocksByName.crafting_table?.id,
+                    maxDistance: 32
+                });
+                if (!table) return 'diamond_craft_no_table';
+            }
+        }
+
+        return null;
+    }
+
+    // ==================== STATE MACHINE ====================
+    async runStateMachine(inv, summary) {
         const has = (name) => inv.some(i => {
             if (name === 'cobblestone') return i.name === 'cobblestone' || i.name === 'cobbled_deepslate' || i.name === 'blackstone';
             return i.name.includes(name);
@@ -110,21 +276,41 @@ class Agent {
             return i.name.includes(name);
         }).reduce((a, b) => a + b.count, 0);
 
+        // ── Vérification générale : remonter à la surface si nécessaire ──────────
+        const surfaceReason = this._requiresSurface(inv, has, count);
+        if (surfaceReason) {
+            console.log(`[Agent] Surface requise (${surfaceReason}) → MoveToSurface`);
+            this.currentTask = new MoveToSurface(this.bot);
+            return;
+        }
+
+        // ── Urgence nourriture : chercher un animal à tuer si mourant de faim ────
+        const foodItems = ['flesh', 'beef', 'pork', 'bread', 'apple', 'carrot', 'potato', 'chicken', 'mutton', 'rabbit', 'cod', 'salmon'];
+        const hasFood = inv.some(i => foodItems.some(f => i.name.includes(f)));
+        if (!hasFood && this.bot.food <= 3 && !['NETHER', 'STRONGHOLD', 'END'].includes(this.stage)) {
+            const passiveMobs = ['cow', 'pig', 'sheep', 'chicken'];
+            const nearbyAnimal = this.bot.nearestEntity(e =>
+                e && e.name && passiveMobs.some(m => e.name.toLowerCase() === m) &&
+                e.position && this.bot.entity.position.distanceTo(e.position) < 32
+            );
+            if (nearbyAnimal) {
+                console.log(`[Agent] FAIM CRITIQUE — chasse ${nearbyAnimal.name} pour nourriture`);
+                this.currentTask = new FightMob(this.bot, nearbyAnimal.name, 1);
+                return;
+            }
+        }
+
         // ========== STAGE: EARLY_GAME ==========
         if (this.stage === 'EARLY_GAME') {
             const hasPick = has('stone_pickaxe');
             const hasSword = inv.some(i => i.name.includes('sword'));
 
-            // Get stone pickaxe AND sword
             if (!hasPick || !hasSword) {
-                // If stone_pickaxe craft failed more than 5 times, skip to IRON with wooden pickaxe
-                // (Only skip if we at least have a pickaxe)
                 if ((this.failedTasks['Craft_stone_pickaxe'] || 0) > 5 && has('wooden_pickaxe')) {
                     console.log("[Agent] Stone pickaxe craft failed multiple times, skipping to IRON stage with wooden pickaxe.");
                     this.stage = 'IRON';
                     return;
                 }
-
                 await this.handleEarlyGame(inv, has, count);
                 return;
             }
@@ -134,7 +320,7 @@ class Agent {
 
         // ========== STAGE: IRON ==========
         if (this.stage === 'IRON') {
-            if (!has('iron_pickaxe')) {
+            if (!has('iron_pickaxe') || !has('iron_sword')) {
                 await this.handleIronStage(inv, has, count);
                 return;
             }
@@ -145,7 +331,7 @@ class Agent {
         // ========== STAGE: DIAMOND ==========
         if (this.stage === 'DIAMOND') {
             if (!has('diamond_pickaxe')) {
-                this.handleDiamondStage(inv, has, count);
+                await this.handleDiamondStage(inv, has, count);
                 return;
             }
             console.log("[Agent] Diamond stage complete! Moving to NETHER stage.");
@@ -183,6 +369,67 @@ class Agent {
         }
 
         console.log("[Agent] VICTORY! Ender Dragon defeated!");
+    }
+
+    // ==================== VALIDATION IA ====================
+    validateAiCommand(decision) {
+        const { action, args } = decision;
+        const inv = this.bot.inventory.items();
+        const has = (name) => inv.some(i => i.name.includes(name));
+
+        // Actions toujours autorisées
+        if (action === 'GetWood' || action === 'MoveToSurface') return true;
+
+        // MineBlock stone/ore : besoin d'une pioche
+        if (action === 'MineBlock') {
+            const blockName = args && args[0];
+            if (blockName && (blockName.includes('stone') || blockName.includes('ore') || blockName.includes('diamond') || blockName.includes('obsidian'))) {
+                if (!has('pickaxe')) {
+                    console.log(`[Agent-IA] REJETÉ: MineBlock ${blockName} sans pioche`);
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // BuildNetherPortal : besoin d'obsidienne + flint
+        if (action === 'BuildNetherPortal') {
+            const obsCount = inv.filter(i => i.name === 'obsidian').reduce((a, b) => a + b.count, 0);
+            if (obsCount < 10) {
+                console.log(`[Agent-IA] REJETÉ: BuildNetherPortal avec ${obsCount}/10 obsidienne`);
+                return false;
+            }
+            if (!has('flint_and_steel')) {
+                console.log(`[Agent-IA] REJETÉ: BuildNetherPortal sans flint_and_steel`);
+                return false;
+            }
+            return true;
+        }
+
+        // SmeltTask : besoin de fuel + input + furnace
+        if (action === 'SmeltTask') {
+            const hasFuel = inv.some(i => i.name.includes('coal') || i.name.includes('log') || i.name.includes('planks') || i.name.includes('charcoal'));
+            if (!hasFuel) {
+                console.log(`[Agent-IA] REJETÉ: SmeltTask sans fuel`);
+                return false;
+            }
+            return true;
+        }
+
+        // FightMob : besoin d'une arme (sauf zombies)
+        if (action === 'FightMob') {
+            const mobType = args && args[0];
+            if (mobType === 'blaze' || mobType === 'enderman') {
+                if (!has('sword') && !has('axe')) {
+                    console.log(`[Agent-IA] REJETÉ: FightMob ${mobType} sans arme`);
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // CraftTask : toujours autorisé (les vérifications sont dans CraftTask)
+        return true;
     }
 
     // ==================== EARLY GAME ====================
@@ -320,6 +567,23 @@ class Agent {
 
         // 1. Mine Iron Ore (need 6 for pickaxe + shield + sword)
         if (count('raw_iron') < 6 && count('iron_ingot') < 6) {
+            // Si du minerai est déjà accessible à portée, le miner directement
+            const ironIds = ['iron_ore', 'deepslate_iron_ore']
+                .map(n => this.mcData.blocksByName[n]?.id)
+                .filter(Boolean);
+            const nearIron = ironIds.length > 0 && this.bot.findBlock({ matching: ironIds, maxDistance: 6 });
+            if (nearIron) {
+                console.log("Goal: Mine Iron Ore (nearby)");
+                this.currentTask = new MineBlock(this.bot, 'iron_ore', 6);
+                return;
+            }
+            // Le fer est plus dense à y=16 — descendre d'abord si on est trop haut
+            if (this.bot.entity.position.y > 20) {
+                console.log("Goal: Dig Down to iron level (y=16)");
+                const DigDown = require('./tasks/DigDown');
+                this.currentTask = new DigDown(this.bot, 16, ['iron_ore', 'deepslate_iron_ore']);
+                return;
+            }
             console.log("Goal: Mine Iron Ore");
             this.currentTask = new MineBlock(this.bot, 'iron_ore', 6);
             return;
@@ -391,6 +655,13 @@ class Agent {
                     }
                 } else {
                     if (count('cobblestone') < 8) {
+                        // Descendre à y=30 pour trouver pierre + charbon en même temps
+                        if (this.bot.entity.position.y > 35) {
+                            console.log("Goal: Dig Down to stone level (y=30)");
+                            const DigDown = require('./tasks/DigDown');
+                            this.currentTask = new DigDown(this.bot, 30, ['coal_ore', 'deepslate_coal_ore']);
+                            return;
+                        }
                         console.log("Goal: Mine Cobblestone for Furnace");
                         this.currentTask = new MineBlock(this.bot, 'stone', 8);
                         return;
@@ -442,6 +713,13 @@ class Agent {
                     this.currentTask = new MineBlock(this.bot, 'coal_ore', 3);
                     return;
                 } else {
+                    // Descendre à y=30 où le charbon est abondant
+                    if (this.bot.entity.position.y > 35) {
+                        console.log("Goal: Dig Down to coal level (y=30)");
+                        const DigDown = require('./tasks/DigDown');
+                        this.currentTask = new DigDown(this.bot, 30, ['coal_ore', 'deepslate_coal_ore']);
+                        return;
+                    }
                     console.log("[Agent] No Coal Ore found nearby. Checking surface/wood fallback.");
                     // If we are deep underground and no coal, we must surface.
                     if (this.bot.entity.position.y < 60) {
@@ -481,6 +759,10 @@ class Agent {
                     console.log(`Goal: Craft Planks for Sticks`);
                     this.currentTask = new CraftTask(this.bot, plankType, 4);
                     return;
+                } else {
+                    console.log("Goal: Get Wood for Sticks (no logs in inventory)");
+                    this.currentTask = new GetWood(this.bot, 3);
+                    return;
                 }
             }
             console.log("Goal: Craft Sticks");
@@ -488,12 +770,26 @@ class Agent {
             return;
         }
 
-        console.log("Goal: Craft Iron Pickaxe");
-        this.currentTask = new CraftTask(this.bot, 'iron_pickaxe');
-        return;
+        if (!has('iron_pickaxe')) {
+            console.log("Goal: Craft Iron Pickaxe");
+            this.currentTask = new CraftTask(this.bot, 'iron_pickaxe');
+            return;
+        }
 
         // Iron Sword crafting (after pickaxe)
         if (!has('iron_sword')) {
+            // Besoin de 2 iron_ingots pour l'épée
+            if (count('iron_ingot') < 2) {
+                if (count('raw_iron') < 2) {
+                    console.log("Goal: Mine more Iron for Sword");
+                    this.currentTask = new MineBlock(this.bot, 'iron_ore', 2);
+                    return;
+                }
+                console.log("Goal: Smelt Iron for Sword");
+                this.currentTask = new SmeltTask(this.bot, 'raw_iron', 'iron_ingot', 2);
+                return;
+            }
+
             await this.ensureTable(inv, has, count);
             if (this.currentTask) return;
 
@@ -534,7 +830,7 @@ class Agent {
             if (this.bot.entity.position.y > 16) {
                 console.log("Goal: Go Deep for Diamonds");
                 const DigDown = require('./tasks/DigDown');
-                this.currentTask = new DigDown(this.bot, -54); // Go to -54 (deepslate)
+                this.currentTask = new DigDown(this.bot, -54, ['diamond_ore', 'deepslate_diamond_ore']);
                 return;
             }
 
@@ -544,7 +840,7 @@ class Agent {
         }
 
         // Craft Diamond Pickaxe
-        this.ensureTable(inv, has, count);
+        await this.ensureTable(inv, has, count);
         if (this.currentTask) return;
 
         if (count('stick') < 2) {
@@ -635,9 +931,12 @@ class Agent {
 
     // ==================== HELPERS ====================
     async ensureTable(inv, has, count) {
+        // Si le bot a une table en inventaire, préférer en poser une proche
+        // plutôt que de marcher vers une table potentiellement bloquée par un autre bot
+        const tableItem = this.bot.inventory.items().find(i => i.name === 'crafting_table');
         const tableBlock = this.bot.findBlock({
             matching: this.mcData.blocksByName.crafting_table.id,
-            maxDistance: 10
+            maxDistance: tableItem ? 4 : 10  // rayon réduit si on en a une en inventaire
         });
 
         // Table already placed nearby
@@ -647,7 +946,6 @@ class Agent {
         }
 
         // Table in inventory, need to place it
-        const tableItem = this.bot.inventory.items().find(i => i.name === 'crafting_table');
         if (tableItem) {
             console.log("Goal: Place Crafting Table");
             // Place it
@@ -705,8 +1003,17 @@ class Agent {
         )) return false;
 
         const pickaxes = inv.filter(i => i.name.includes('pickaxe'));
-        // If we have 2 or more, we are safe.
-        if (pickaxes.length >= 2) return false;
+        if (pickaxes.length >= 2) {
+            this._redundancyAttempts = 0;
+            return false;
+        }
+
+        this._redundancyAttempts++;
+        if (this._redundancyAttempts > 3) {
+            console.log(`[Agent] Redundancy: échec répété (${this._redundancyAttempts}), on passe.`);
+            this._redundancyAttempts = 0;
+            return false;
+        }
 
         console.log(`[Agent] Redundancy Check: Only ${pickaxes.length} pickaxe(s). Need backup.`);
 
@@ -745,19 +1052,15 @@ class Agent {
         }
 
         // We have sticks. Do we have cobble?
-        if (count('cobblestone') < 3) {
-            // Can we mine it? Yes if we have ANY pickaxe.
+        // Compter UNIQUEMENT cobblestone pur (pas cobbled_deepslate/blackstone car recette non mixable)
+        const strictCobble = inv.filter(i => i.name === 'cobblestone').reduce((a, b) => a + b.count, 0);
+        if (strictCobble < 3) {
             const hasPick = pickaxes.length > 0;
             if (hasPick) {
-                // It's okay to have <3 cobble, we can strip mine or standard mine.
-                // But wait, if we are here, we want to PREPARE before a long mine session.
-                // Let's just create one if we happen to have cobble. 
-                // If we don't have cobble, checking redundancy might be premature unless durability is critically low.
-                // Let's assume if we are mining Stone/Iron, we will get cobble soon.
-                // So only force craft if we HAVE cobble.
-                return false;
+                console.log(`[Agent] Manque cobblestone pur pour backup (${strictCobble}/3) → Mine Stone`);
+                this.currentTask = new MineBlock(this.bot, 'stone', 3);
+                return true;
             } else {
-                // No pickaxe at all? Logic elsewhere handles this (GetWood -> Wooden Pick).
                 return false;
             }
         }
@@ -767,8 +1070,42 @@ class Agent {
         if (this.currentTask) return true;
 
         console.log("[Agent] Crafting backup Stone Pickaxe");
-        this.currentTask = new CraftTask(this.bot, 'stone_pickaxe');
+        this.currentTask = new CraftTask(this.bot, 'stone_pickaxe', 2);
         return true;
+    }
+
+    // ==================== EXECUTION IA ====================
+    executeAiCommand(decision) {
+        const { action, args } = decision;
+        try {
+            switch (action) {
+                case 'GetWood':
+                    this.currentTask = new GetWood(this.bot, args[0] || 3);
+                    break;
+                case 'CraftTask':
+                    this.currentTask = new CraftTask(this.bot, args[0], args[1] || 1);
+                    break;
+                case 'MineBlock':
+                    this.currentTask = new MineBlock(this.bot, args[0], args[1] || 1);
+                    break;
+                case 'SmeltTask':
+                    this.currentTask = new SmeltTask(this.bot, args[0], args[1], args[2] || 1);
+                    break;
+                case 'MoveToSurface':
+                    this.currentTask = new MoveToSurface(this.bot);
+                    break;
+                case 'FightMob':
+                    this.currentTask = new FightMob(this.bot, args[0], args[1] || 1);
+                    break;
+                case 'BuildNetherPortal':
+                    this.currentTask = new BuildNetherPortal(this.bot);
+                    break;
+                default:
+                    console.log(`[Agent-IA] Action inconnue fournie par l'IA: ${action}`);
+            }
+        } catch (err) {
+            console.log(`[Agent-IA] Erreur lors de l'attribution de la tâche: ${err.message}`);
+        }
     }
 }
 

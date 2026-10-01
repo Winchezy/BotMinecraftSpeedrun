@@ -11,8 +11,10 @@ class CraftTask extends Task {
 
     async run() {
         console.log(`[DEBUG] CraftTask running for ${this.itemName}`);
-        const item = this.bot.inventory.items().find(i => i.name === this.itemName);
-        if (item && item.count >= this.count) {
+        const totalCount = this.bot.inventory.items()
+            .filter(i => i.name === this.itemName)
+            .reduce((sum, i) => sum + i.count, 0);
+        if (totalCount >= this.count) {
             this.complete();
             return;
         }
@@ -80,8 +82,16 @@ class CraftTask extends Task {
             try {
                 await this.bot.pathfinder.goto(new goals.GoalNear(table.position.x, table.position.y, table.position.z, 2));
             } catch (e) {
-                this.fail(`Path to table failed: ${e.message}`);
-                return;
+                console.log(`[CraftTask] Table inaccessible (${e.message}), tentative de poser une nouvelle table.`);
+                const tableItem = this.bot.inventory.items().find(i => i.name === 'crafting_table');
+                if (tableItem) {
+                    await this.placeTable(tableItem);
+                    table = this.bot.findBlock({ matching: this.mcData.blocksByName.crafting_table.id, maxDistance: 4 });
+                    if (!table) { this.fail('Impossible de poser une table à proximité'); return; }
+                } else {
+                    this.fail(`Table inaccessible et aucune table en inventaire`);
+                    return;
+                }
             }
         }
 
@@ -99,6 +109,8 @@ class CraftTask extends Task {
             // Debug why
             const allRecipes = this.bot.recipesAll(targetId, null, table);
             if (allRecipes.length > 0) {
+                const invSummary = this.bot.inventory.items().map(i => `${i.name}x${i.count}`).join(', ');
+                console.log(`[CraftTask] Inventory: ${invSummary}`);
                 this.fail(`Missing ingredients for ${this.itemName} (Needs table=${!!table})`);
             } else {
                 this.fail(`No recipes found for ${this.itemName}`);
@@ -114,8 +126,8 @@ class CraftTask extends Task {
         // Try to place on the block right in front/side of us
         const nearby = this.bot.findBlocks({
             matching: b => b.boundingBox === 'block' && b.name !== 'air',
-            maxDistance: 3,
-            count: 30
+            maxDistance: 5,
+            count: 50
         });
 
         for (const pos of nearby) {
