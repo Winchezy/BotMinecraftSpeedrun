@@ -56,6 +56,8 @@ class GetWood extends Task {
             await this._stuckHandler();
         }
 
+        if (this.cancelled) return;
+
         // Enregistrer uniquement si l'action a réussi
         if (this.countLogs() > logsBefore) {
             brain.recordSuccess(this.bot, treeInfo, action);
@@ -247,10 +249,21 @@ class GetWood extends Task {
             botPos.distanceTo(a.position) - botPos.distanceTo(b.position)
         );
 
+        // Au plus 3 bûches tentées par appel : chaque essai peut prendre ~14 s, et un
+        // run() de plus de 45 s déclenche le watchdog de l'Agent. Les suivantes seront
+        // tentées au prochain tick (les échecs restent en blacklist).
+        const MAX_ATTEMPTS = 3;
+        let attempts = 0;
+
         for (const log of sorted) {
+            if (this.cancelled) return;
             const key = `${log.position.x},${log.position.y},${log.position.z}`;
             if (this.blacklistedPositions.has(key)) continue;
             if (this._isTreeBlacklisted(log)) continue;
+            if (++attempts > MAX_ATTEMPTS) {
+                console.log(`[${this.name}] ${MAX_ATTEMPTS} essais sans succès ce tick, on réessaiera au suivant.`);
+                return;
+            }
 
             const logsBefore = this.countLogs();
             console.log(`[${this.name}] Mining nearest: ${log.name} at ${log.position}`);
@@ -293,6 +306,7 @@ class GetWood extends Task {
             }
         }
 
+        if (this.cancelled) return;
         console.log(`[${this.name}] All logs failed. Wandering...`);
         this.blacklistedPositions.clear();
         await this._wander();

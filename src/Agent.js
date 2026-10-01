@@ -81,6 +81,7 @@ class Agent {
         // une tache en cours quand la faim devient critique.
         if (this.bot.food <= 6 && !(this.currentTask instanceof GetFood)) {
             if (this.currentTask) {
+                this.currentTask.cancel();
                 try { this.bot.stopDigging(); } catch (e) { }
                 try { this.bot.pathfinder.stop(); } catch (e) { }
                 try { this.bot.clearControlStates(); } catch (e) { }
@@ -110,6 +111,9 @@ class Agent {
                 ]);
             } catch (err) {
                 console.log(`Task Error: ${err.message}`);
+                // Le run() figé continue en arrière-plan : le marquer annulé pour qu'il
+                // s'arrête au lieu de piloter le bot en parallèle de la tâche suivante.
+                this.currentTask.cancel();
                 // En cas de blocage : couper proprement minage / pathfinding / controles.
                 try { this.bot.stopDigging(); } catch (e) { }
                 try { this.bot.pathfinder.stop(); } catch (e) { }
@@ -127,6 +131,10 @@ class Agent {
 
         // Tâche terminée, on la nettoie
         if (this.currentTask && this.currentTask.isDone()) {
+            // Mémoriser si du minerai attend dans le four faute de combustible
+            if (this.currentTask instanceof SmeltTask) {
+                this._furnaceNeedsFuel = !!this.currentTask.needsFuel;
+            }
             if (this.currentTask.hasFailed) {
                 const taskName = this.currentTask.name;
                 this.failedTasks[taskName] = (this.failedTasks[taskName] || 0) + 1;
@@ -732,6 +740,22 @@ class Agent {
         //    Symptome : on a deja des lingots mais pas 6, et plus de minerai brut en main.
         //    Si le four est vide, SmeltTask echoue -> on tombe sur l'etape de minage.
         const smeltCollectName = 'Smelt_raw_iron_to_iron_ingot';
+
+        //    Cas particulier : la fonte s'est arrêtée faute de combustible, le minerai est
+        //    resté dans le four. On recharge en combustible et on y retourne.
+        if (this._furnaceNeedsFuel && count('iron_ingot') < 6) {
+            const hasFuel = inv.some(i => i.name === 'coal' || i.name === 'charcoal' ||
+                i.name.includes('planks') || (i.name.includes('log') && !i.name.includes('stripped')));
+            if (!hasFuel) {
+                console.log("[Agent] Minerai bloqué dans le four sans combustible -> GetWood.");
+                this.currentTask = new GetWood(this.bot, 2);
+                return;
+            }
+            console.log("[Agent] Combustible récupéré -> retour au four.");
+            this.currentTask = new SmeltTask(this.bot, 'raw_iron', 'iron_ingot', 6);
+            return;
+        }
+
         if (count('iron_ingot') >= 1 && count('iron_ingot') < 6 && count('raw_iron') === 0
             && (this.failedTasks[smeltCollectName] || 0) === 0) {
             const furnaceNearby = this.bot.findBlock({

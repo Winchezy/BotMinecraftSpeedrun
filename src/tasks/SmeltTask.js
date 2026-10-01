@@ -59,51 +59,14 @@ class SmeltTask extends Task {
         console.log(`[${this.name}] Opening furnace at ${furnace.position}`);
         const furnaceBlock = await this.bot.openFurnace(furnace);
 
-        // Add fuel if needed
-        if (!furnaceBlock.fuelItem()) {
-            const items = this.bot.inventory.items();
-            let fuel = items.find(i => i.name === 'coal' || i.name === 'charcoal');
-            if (!fuel) fuel = items.find(i => i.name.includes('planks'));
-            if (!fuel) fuel = items.find(i => i.name.includes('log'));
-            if (!fuel) fuel = items.find(i => i.name === 'stick');
-
-            // Emergency fuel: wooden tools if we have better ones
-            if (!fuel) {
-                const hasStonePick = items.some(i => i.name === 'stone_pickaxe' || i.name === 'iron_pickaxe' || i.name === 'diamond_pickaxe');
-                if (hasStonePick) {
-                    fuel = items.find(i => i.name === 'wooden_pickaxe');
-                }
-            }
-            // Emergency fuel: wooden sword if we have stone
-            if (!fuel) {
-                const hasStoneSword = items.some(i => i.name === 'stone_sword' || i.name === 'iron_sword' || i.name === 'diamond_sword');
-                if (hasStoneSword) {
-                    fuel = items.find(i => i.name === 'wooden_sword');
-                }
-            }
-
-
-            if (fuel) {
-                console.log(`[${this.name}] Adding fuel: ${fuel.name}`);
-                try {
-                    await furnaceBlock.putFuel(fuel.type, null, (fuel.name.includes('pickaxe') || fuel.name.includes('sword')) ? 1 : Math.min(fuel.count, 8));
-                } catch (err) {
-                    console.log(`[${this.name}] Failed to put fuel: ${err.message}`);
-                }
-            } else {
-                console.log(`[${this.name}] No fuel available in inventory.`);
-                furnaceBlock.close();
-                this.fail("No fuel available");
-                return;
-            }
-        }
-
-        // Add input items
+        // Add input items (avant le combustible, pour savoir combien il en faut)
         const input = this.bot.inventory.items().find(i => i.name === this.inputItem);
         let addedInput = false;
         let collectedAny = false;
+        let needsFuel = false;
         if (input) {
-            const amountToSmelt = Math.min(input.count, this.count - outputCount);
+            const alreadyIn = furnaceBlock.inputItem() ? furnaceBlock.inputItem().count : 0;
+            const amountToSmelt = Math.min(input.count, this.count - outputCount - alreadyIn);
             if (amountToSmelt > 0) {
                 console.log(`[${this.name}] Adding input: ${input.name} x${amountToSmelt}`);
                 try {
@@ -115,14 +78,24 @@ class SmeltTask extends Task {
             }
         }
 
+        // Combustible : dimensionné sur ce qui reste à fondre dans le four
+        if (!(await this.ensureFuel(furnaceBlock))) needsFuel = true;
+
         // Monitor smelting
         console.log(`[${this.name}] Monitoring smelting...`);
         const maxTicks = 200; // 10 seconds per cycle
         let ticks = 0;
 
-        while (ticks < maxTicks) {
+        while (ticks < maxTicks && !needsFuel) {
             await this.bot.waitForTicks(20);
             ticks += 20;
+            if (this.cancelled) break;
+
+            // Le combustible s'est épuisé alors qu'il reste du minerai : recharger
+            if (!(await this.ensureFuel(furnaceBlock))) {
+                needsFuel = true;
+                break;
+            }
 
             if (furnaceBlock.outputItem()) {
                 console.log(`[${this.name}] Taking output: ${furnaceBlock.outputItem().name}`);
@@ -146,16 +119,86 @@ class SmeltTask extends Task {
             }
         }
 
+        // Récupérer ce qui a fini de fondre avant de fermer
+        if (furnaceBlock.outputItem()) {
+            try { await furnaceBlock.takeOutput(); collectedAny = true; } catch (_) { }
+        }
+        const inputLeft = furnaceBlock.inputItem() ? furnaceBlock.inputItem().count : 0;
         furnaceBlock.close();
+        if (this.cancelled) return;
+
+        const finalOut = this.bot.inventory.items()
+            .filter(i => i.name === this.outputItem)
+            .reduce((a, b) => a + b.count, 0);
+        if (finalOut >= this.count) return; // complete() au prochain run()
+
+        // Minerai encore dans le four mais plus rien à brûler : échec explicite
+        // (needsFuel) pour que l'Agent aille chercher du combustible puis revienne.
+        if (needsFuel) {
+            this.needsFuel = true;
+            this.fail(`Combustible insuffisant (${inputLeft} ${this.inputItem} restant dans le four)`);
+            return;
+        }
 
         // Rien ajoute ni collecte et toujours pas assez : le four est vide et on n'a pas
         // de matiere premiere -> echec EXPLICITE pour que l'Agent aille miner, au lieu de
         // relancer Smelt a vide indefiniment.
-        const finalOut = this.bot.inventory.items()
-            .filter(i => i.name === this.outputItem)
-            .reduce((a, b) => a + b.count, 0);
-        if (finalOut < this.count && !addedInput && !collectedAny) {
+        if (!addedInput && !collectedAny && inputLeft === 0) {
             this.fail("Rien a fondre (four vide, pas de matiere premiere)");
+        }
+    }
+
+    // Valeur de combustion en nombre d'objets fondus. Les outils ne sont JAMAIS
+    // brûlés : l'ancienne version brûlait la pioche en bois, qui sert de pioche de
+    // secours (ensurePickaxeRedundancy), d'où une boucle brûler/re-crafter.
+    fuelValue(name) {
+        if (name === 'coal_block') return 80;
+        if (name === 'coal' || name === 'charcoal') return 8;
+        if (name.includes('planks')) return 1.5;
+        if (name.includes('log') || name.endsWith('_wood')) return 1.5;
+        if (name === 'stick') return 0.5;
+        return 0;
+    }
+
+    pickFuel() {
+        const items = this.bot.inventory.items();
+        // Planches avant bûches : 1 bûche = 4 planches = 6 fontes au lieu de 1,5
+        const order = [
+            i => i.name === 'coal' || i.name === 'charcoal',
+            i => i.name === 'coal_block',
+            i => i.name.includes('planks'),
+            i => i.name.includes('log') || i.name.endsWith('_wood'),
+            i => i.name === 'stick',
+        ];
+        for (const match of order) {
+            const fuel = items.find(match);
+            if (fuel) return fuel;
+        }
+        return null;
+    }
+
+    // S'assure qu'il y a de quoi brûler pour tout le minerai présent dans le four.
+    // Retourne false seulement s'il reste du minerai, que le four est éteint et
+    // qu'on n'a plus aucun combustible.
+    async ensureFuel(furnaceBlock) {
+        const pending = furnaceBlock.inputItem() ? furnaceBlock.inputItem().count : 0;
+        if (pending === 0) return true;
+        if (furnaceBlock.fuelItem()) return true;           // combustible en attente
+        if ((furnaceBlock.fuel || 0) > 0) return true;      // brûle encore
+
+        const fuel = this.pickFuel();
+        if (!fuel) {
+            console.log(`[${this.name}] Plus de combustible (${pending} ${this.inputItem} en attente).`);
+            return false;
+        }
+        const qty = Math.min(fuel.count, Math.max(1, Math.ceil(pending / this.fuelValue(fuel.name))));
+        console.log(`[${this.name}] Adding fuel: ${fuel.name} x${qty} (pour ${pending} à fondre)`);
+        try {
+            await furnaceBlock.putFuel(fuel.type, null, qty);
+            return true;
+        } catch (err) {
+            console.log(`[${this.name}] Failed to put fuel: ${err.message}`);
+            return false;
         }
     }
 
