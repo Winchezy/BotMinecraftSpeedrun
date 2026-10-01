@@ -14,15 +14,13 @@ Ceci est un bot de speedrun Minecraft construit avec Mineflayer qui joue automat
 node index.js localhost <PORT> BotName
 ```
 
-Le bot se connecte à un serveur Minecraft 1.21.1 local (note : le code spécifie 1.20.4 dans bot.js:14). Vous devez :
-1. Créer un monde dans Minecraft 1.21.1
+Le bot se lance uniquement sur un monde créé par l'utilisateur dans son jeu et ouvert en LAN (il n'y a pas de serveur dédié dans le projet ; note : le code spécifie 1.20.4 dans bot.js:14). Vous devez :
+1. Créer un monde dans Minecraft
 2. Ouvrir au LAN avec les cheats activés
-3. Noter le numéro de port affiché dans le chat
-4. Lancer le bot avec ce port
+3. Noter le numéro de port affiché dans le chat (il change à chaque ouverture)
+4. Lancer le bot avec ce port : `node index.js localhost <PORT> BotName` ou `run_bot.bat <PORT>`
 
-### Serveur de développement
-
-Le répertoire `server/` contient une installation de serveur Minecraft (server.jar, données du monde, server.properties). Utilisez `start_server.bat` pour le lancer.
+Le port est obligatoire : sans lui, `index.js`, `recorder.js` et `tools/autopilot.cjs start <PORT>` s'arrêtent avec un message d'aide.
 
 ### Visualisation des logs
 
@@ -151,7 +149,6 @@ Le bot charge ces plugins (voir `src/bot.js`) :
 
 - Le code cible Minecraft 1.20.4 (voir bot.js:14)
 - Le README mentionne 1.21.1 - peut nécessiter un ajustement de version pour la compatibilité
-- Le serveur dans le répertoire `server/` est spécifique à une version
 
 ## Failles de logique identifiées
 

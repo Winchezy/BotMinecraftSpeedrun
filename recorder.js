@@ -10,7 +10,12 @@ process.on('unhandledRejection', (err) => {
 
 const args = process.argv.slice(2);
 const host = args[0] || 'localhost';
-const port = parseInt(args[1]) || 25565;
+// Monde ouvert en LAN depuis le jeu : le port change a chaque ouverture.
+const port = parseInt(args[1]);
+if (!port) {
+    console.error('Port manquant : node recorder.js localhost <PORT> (port affiche apres "Ouvrir au LAN").');
+    process.exit(1);
+}
 
 console.log(`Démarrage du Recorder sur ${host}:${port}`);
 console.log('Commandes disponibles dans le chat Minecraft :');

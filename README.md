@@ -25,6 +25,10 @@ Exemple :
 node index.js localhost 12345 RunnerBot
 ```
 
+Ou, avec relance automatique en cas de crash : `run_bot.bat 12345` (sans argument, le port est demandé).
+
+Le bot ne fonctionne que sur un monde que vous avez créé et ouvert en LAN : le port est obligatoire, il n'y a pas de port ni de serveur par défaut.
+
 ## Structure du code
 
 - `src/brain.js` : Le cerveau qui décide de l'action suivante (State Machine).

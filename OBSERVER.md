@@ -1,6 +1,6 @@
 # Observation du comportement
 
-L'observateur demarre automatiquement avec `node index.js localhost 25565 SpeedBot`.
+L'observateur demarre automatiquement avec `node index.js localhost <PORT> SpeedBot` (port du monde ouvert en LAN).
 Il lit l'etat du joueur une fois par seconde, sans lui envoyer de commandes.
 
 Un rapport est ecrit toutes les 30 secondes :

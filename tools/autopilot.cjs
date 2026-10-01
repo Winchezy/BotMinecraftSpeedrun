@@ -5,7 +5,8 @@ const { spawn } = require('node:child_process');
 const ROOT = path.resolve(__dirname, '..');
 const DIR = path.join(ROOT, '.bot-state', 'autopilot');
 const DEFAULTS = {
-    enabled: true, host: '127.0.0.1', port: 25565, username: 'SpeedBot', model: 'gpt-6-sol',
+    // port : celui du monde ouvert en LAN depuis le jeu (change a chaque ouverture).
+    enabled: true, host: '127.0.0.1', port: null, username: 'SpeedBot', model: 'gpt-6-sol',
     pollMs: 5000, consecutiveReports: 3, cooldownMs: 300000, maxAttemptsPerHour: 3,
     repairTimeoutMs: 600000, validationMs: 120000,
     codexScript: path.join(process.env.APPDATA || '', 'npm', 'node_modules', '@openai', 'codex', 'bin', 'codex.js')
@@ -317,6 +318,9 @@ Si les preuves ne suffisent pas, retourne no_fix. Sinon implemente et valide la 
     }
 
     async start() {
+        if (!Number.isInteger(this.config.port) || this.config.port <= 0) {
+            throw new Error('Port LAN manquant : ouvrez votre monde au LAN puis lancez node tools/autopilot.cjs start <PORT>');
+        }
         this.lockFile = path.join(this.dir, 'lock.json');
         const old = readJSON(this.lockFile);
         if (old?.pid) {
@@ -353,8 +357,9 @@ async function main() {
     fs.mkdirSync(DIR, { recursive: true });
     if (command === 'status') { console.log(JSON.stringify(readJSON(path.join(DIR, 'status.json')), null, 2)); return; }
     if (command === 'stop') { fs.writeFileSync(path.join(DIR, 'stop'), 'stop'); console.log('Arret demande au superviseur.'); return; }
-    if (command !== 'start') throw new Error('Usage : node tools/autopilot.cjs start|status|stop');
-    const supervisor = new Supervisor();
+    if (command !== 'start') throw new Error('Usage : node tools/autopilot.cjs start <PORT>|status|stop');
+    const port = parseInt(process.argv[3]);
+    const supervisor = new Supervisor(port ? { config: { port } } : {});
     process.once('SIGINT', () => supervisor.stop());
     process.once('SIGTERM', () => supervisor.stop());
     await supervisor.start();

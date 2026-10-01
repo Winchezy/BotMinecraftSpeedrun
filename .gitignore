@@ -1,5 +1,4 @@
 node_modules/
-server/
 bot.log
 bot_debug.log
 .bot-state/
