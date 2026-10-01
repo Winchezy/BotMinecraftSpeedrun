@@ -1,8 +1,5 @@
-node_modules
+node_modules/
 .env
-CLAUDE.md
-bot_debug.log
-bot.log
 server/
-check_proto.js
-check_version.js
+bot.log
+bot_debug.log

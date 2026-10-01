@@ -100,12 +100,15 @@ class SmeltTask extends Task {
 
         // Add input items
         const input = this.bot.inventory.items().find(i => i.name === this.inputItem);
+        let addedInput = false;
+        let collectedAny = false;
         if (input) {
             const amountToSmelt = Math.min(input.count, this.count - outputCount);
             if (amountToSmelt > 0) {
                 console.log(`[${this.name}] Adding input: ${input.name} x${amountToSmelt}`);
                 try {
                     await furnaceBlock.putInput(input.type, null, amountToSmelt);
+                    addedInput = true;
                 } catch (err) {
                     console.log(`[${this.name}] Failed to put input: ${err.message}`);
                 }
@@ -124,6 +127,7 @@ class SmeltTask extends Task {
             if (furnaceBlock.outputItem()) {
                 console.log(`[${this.name}] Taking output: ${furnaceBlock.outputItem().name}`);
                 await furnaceBlock.takeOutput();
+                collectedAny = true;
             }
 
             // Check if we need to return
@@ -143,40 +147,61 @@ class SmeltTask extends Task {
         }
 
         furnaceBlock.close();
+
+        // Rien ajoute ni collecte et toujours pas assez : le four est vide et on n'a pas
+        // de matiere premiere -> echec EXPLICITE pour que l'Agent aille miner, au lieu de
+        // relancer Smelt a vide indefiniment.
+        const finalOut = this.bot.inventory.items()
+            .filter(i => i.name === this.outputItem)
+            .reduce((a, b) => a + b.count, 0);
+        if (finalOut < this.count && !addedInput && !collectedAny) {
+            this.fail("Rien a fondre (four vide, pas de matiere premiere)");
+        }
     }
 
     async placeFurnace(furnaceItem) {
         const { Vec3 } = require('vec3');
         console.log(`[SmeltTask] Looking for spot to place furnace...`);
 
+        // Blocs occupes par le bot lui-meme : on ne peut pas poser le fourneau dedans.
+        const feetPos = this.bot.entity.position.floored();
+        const headPos = feetPos.offset(0, 1, 0);
+
         const nearby = this.bot.findBlocks({
             matching: b => b.type !== this.mcData.blocksByName.air.id &&
                 b.boundingBox === 'block' &&
-                b.name !== 'crafting_table', // Avoid placing on crafting table
-            maxDistance: 5,
-            count: 20
+                b.name !== 'crafting_table' && // Avoid placing on crafting table
+                b.name !== 'furnace',
+            maxDistance: 4,
+            count: 30
         });
+
+        // Poser au plus proche d'abord (utile quand le bot est perche sur un pilier)
+        nearby.sort((a, b) => this.bot.entity.position.distanceTo(a) - this.bot.entity.position.distanceTo(b));
 
         for (const pos of nearby) {
             const above = pos.offset(0, 1, 0);
             const blockAbove = this.bot.blockAt(above);
 
-            // Check if space above is clear (air or replaceable plant)
-            if (blockAbove && (blockAbove.name.includes('air') || blockAbove.name.includes('grass') || blockAbove.name.includes('fern') || blockAbove.name.includes('snow'))) {
-                // Ensure bot is not standing in the way
-                const centerAbove = above.offset(0.5, 0.5, 0.5);
-                if (this.bot.entity.position.distanceTo(centerAbove) > 1.3) {
-                    try {
-                        console.log(`[SmeltTask] Attempting to place furnace at ${above}`);
-                        await this.bot.equip(furnaceItem, 'hand');
-                        await this.bot.lookAt(pos.offset(0.5, 1, 0.5), false);
-                        await this.bot.placeBlock(this.bot.blockAt(pos), new Vec3(0, 1, 0));
-                        console.log(`[SmeltTask] Furnace placed successfully.`);
-                        return;
-                    } catch (err) {
-                        console.log(`[SmeltTask] Failed to place furnace at ${above}: ${err.message}`);
-                    }
-                }
+            // L'espace au-dessus doit etre vide (air ou plante remplacable)...
+            if (!blockAbove || !(blockAbove.name.includes('air') || blockAbove.name.includes('grass') ||
+                blockAbove.name.includes('fern') || blockAbove.name.includes('snow'))) continue;
+
+            // ...et ne pas etre la colonne ou se tient le bot (sinon placement impossible).
+            // Ancien bug : un test de distance > 2.0 rejetait TOUS les blocs adjacents
+            // quand le bot etait perche sur un pilier d'1 bloc -> aucune pose possible.
+            if (above.equals(feetPos) || above.equals(headPos)) continue;
+
+            try {
+                console.log(`[SmeltTask] Attempting to place furnace at ${above}`);
+                await this.bot.equip(furnaceItem, 'hand');
+                await this.bot.lookAt(pos.offset(0.5, 1, 0.5), false);
+                await this.bot.placeBlock(this.bot.blockAt(pos), new Vec3(0, 1, 0));
+                console.log(`[SmeltTask] Furnace placed successfully.`);
+                return;
+            } catch (err) {
+                console.log(`[SmeltTask] Failed to place furnace at ${above}: ${err.message}`);
+                // Continue to next spot
             }
         }
         

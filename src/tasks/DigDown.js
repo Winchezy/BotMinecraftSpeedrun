@@ -24,9 +24,39 @@ class DigDown extends Task {
         this._tunnelFailures      = 0; // échecs TUNNEL consécutifs
         this._forceStaircaseTicks = 0; // ticks restants à forcer STAIRCASE
         this._bridgedBlocks       = new Set(); // ponts posés : interdits au creusage
+        this._lastY               = null;  // suivi de progression verticale
+        this._noProgress          = 0;     // ticks STAIRCASE sans descente
+        this._digFails            = 0;     // aborts de minage consécutifs (eau/Survival)
     }
 
     _posKey(v) { return `${v.x},${v.y},${v.z}`; }
+
+    _isLiquid(b) { return !!b && (b.name.includes('water') || b.name.includes('lava')); }
+    _isSolid(b)  { return !!b && b.boundingBox === 'block'; }
+
+    // dig avec timeout : ne gèle jamais, retourne true si cassé (ou rien à casser).
+    async _safeDig(block) {
+        if (!this._isSolid(block)) return true;
+        if (block.name === 'bedrock' || block.name.includes('lava')) return false;
+        try {
+            await Promise.race([
+                this.bot.dig(block),
+                new Promise((_, rej) => setTimeout(() => rej(new Error('dig timeout')), 8000))
+            ]);
+            this._digFails = 0;
+            return true;
+        } catch (e) {
+            try { this.bot.stopDigging(); } catch (_) { }
+            this._digFails++;
+            console.log(`[DigDown] dig interrompu (${this._digFails}): ${e.message}`);
+            // Aborts en continu (eau/Survival qui annule le dig) : on abandonne pour que
+            // le disjoncteur de l'Agent relocalise sur un sol sec, au lieu de boucler.
+            if (this._digFails >= 12) {
+                this.fail('Minage bloque en continu (eau/Survival) - relocalisation requise');
+            }
+            return false;
+        }
+    }
 
     // Trouve le minerai cible le plus proche dans le rayon de détection
     _findTargetOre() {
@@ -136,6 +166,22 @@ class DigDown extends Task {
         const dz      = -Math.cos(cardinal);
         const forward = new Vec3(Math.round(dx), 0, Math.round(dz));
 
+        // ── Watchdog de progression (STAIRCASE) ──────────────────────────────
+        // Si on ne descend plus du tout (coincé dans l'eau/une grotte), on abandonne
+        // pour laisser l'Agent relocaliser ailleurs au lieu de monopoliser le bot.
+        if (mode === 'STAIRCASE') {
+            const curY = Math.floor(pos.y);
+            if (this._lastY === null || curY < this._lastY) {
+                this._lastY = curY;
+                this._noProgress = 0;
+            } else if (++this._noProgress > 60) {
+                console.log('[DigDown] Aucune progression -> abandon (relocalisation requise).');
+                if (movementBrain) movementBrain.saveAll();
+                this.fail('Descente bloquee');
+                return;
+            }
+        }
+
         // ── Exécution ────────────────────────────────────────────────────────
         if (mode === 'TUNNEL') {
             await this._runTunnel();
@@ -214,6 +260,37 @@ class DigDown extends Task {
         }
     }
 
+    // Pose un bloc à `target` (un vide) en s'appuyant sur n'importe quel voisin solide.
+    async _fillVoid(target) {
+        const placeable = this.bot.inventory.items().find(i =>
+            ['cobblestone', 'dirt', 'stone', 'andesite', 'diorite', 'granite',
+             'netherrack', 'cobbled_deepslate', 'deepslate', 'tuff'].includes(i.name)
+        );
+        if (!placeable) { console.log('[DigDown] Rien pour combler.'); return false; }
+
+        const dirs = [new Vec3(0, -1, 0), new Vec3(1, 0, 0), new Vec3(-1, 0, 0), new Vec3(0, 0, 1), new Vec3(0, 0, -1)];
+        for (const d of dirs) {
+            const ref = this.bot.blockAt(target.plus(d));
+            if (!this._isSolid(ref)) continue;
+            const face = new Vec3(-d.x, -d.y, -d.z); // face exposée de `ref` vers `target`
+            try {
+                await this.bot.equip(placeable, 'hand');
+                await this.bot.lookAt(target.offset(0.5, 0.5, 0.5), false);
+                await Promise.race([
+                    this.bot.placeBlock(ref, face),
+                    new Promise((_, rej) => setTimeout(() => rej(new Error('place timeout')), 6000))
+                ]);
+                // Mémoriser le pont pour ne JAMAIS le re-creuser
+                this._bridgedBlocks.add(this._posKey(target));
+                console.log('[DigDown] Vide comblé.');
+                return true;
+            } catch (e) {
+                // essayer le voisin suivant
+            }
+        }
+        return false;
+    }
+
     // Équipe la meilleure pioche disponible (fer > pierre > bois...)
     async _equipBestPickaxe() {
         const order = ['netherite_pickaxe', 'diamond_pickaxe', 'iron_pickaxe', 'stone_pickaxe', 'golden_pickaxe', 'wooden_pickaxe'];
@@ -244,6 +321,15 @@ class DigDown extends Task {
         const targetFloor  = new Vec3(botPos.x + forward.x, feetY - 1, botPos.z + forward.z);
         const targetFloor2 = new Vec3(botPos.x + forward.x, feetY - 2, botPos.z + forward.z);
 
+        // Liquide dans le chemin -> contourner (ne pas se battre avec l'eau).
+        // Placé AVANT le bloc neuronal pour qu'aucune action neuronale ne le court-circuite.
+        if (this._isLiquid(this.bot.blockAt(targetHead)) || this._isLiquid(this.bot.blockAt(targetBody)) ||
+            this._isLiquid(this.bot.blockAt(targetFloor))) {
+            console.log('[DigDown] Liquide dans le chemin -> contournement.');
+            this._stuckTicks = 25; // force une rotation au prochain tick
+            return;
+        }
+
         // ── Décision neuronale ────────────────────────────────────────────────
         if (movementBrain) {
             const neuralDecision = movementBrain.decideDigAction(
@@ -256,12 +342,12 @@ class DigDown extends Task {
                 const blkFloor = this.bot.blockAt(targetFloor);
 
                 if (action === 'DIG_HEAD' && blkHead && blkHead.boundingBox === 'block') {
-                    await this.bot.dig(blkHead); return;
+                    await this._safeDig(blkHead); return;
                 } else if (action === 'DIG_BODY' && blkBody && blkBody.boundingBox === 'block') {
-                    await this.bot.dig(blkBody); return;
+                    await this._safeDig(blkBody); return;
                 } else if (action === 'DIG_FLOOR' && blkFloor && blkFloor.boundingBox === 'block'
                            && !this._bridgedBlocks.has(this._posKey(targetFloor))) {
-                    await this.bot.dig(blkFloor); return;
+                    await this._safeDig(blkFloor); return;
                 } else if (action === 'DIG_UNDER') {
                     const blkUnder = this.bot.blockAt(botPos.offset(0, -1, 0));
                     // Jamais creuser sous ses pieds si c'est un pont ou si le vide
@@ -270,7 +356,7 @@ class DigDown extends Task {
                         && !this._bridgedBlocks.has(this._posKey(botPos.offset(0, -1, 0)))
                         && this._dropDepthAhead(botPos.offset(0, -2, 0)) <= 1;
                     if (safeUnder) {
-                        await this.bot.dig(blkUnder); return;
+                        await this._safeDig(blkUnder); return;
                     }
                 } else if (action === 'MOVE_FORWARD') {
                     // Valider que la voie est libre ET qu'il n'y a pas de grand vide devant
@@ -303,23 +389,21 @@ class DigDown extends Task {
         // 1. Dégager la tête
         const blkHead = this.bot.blockAt(targetHead);
         if (blkHead && blkHead.boundingBox === 'block') {
-            await this.bot.dig(blkHead);
-            if (movementBrain) movementBrain.recordDigSuccess(this.bot, 'DIG_HEAD', this.targetY, forward, this._stuckTicks, this.bot.entity.position.y);
+            if (await this._safeDig(blkHead) && movementBrain) movementBrain.recordDigSuccess(this.bot, 'DIG_HEAD', this.targetY, forward, this._stuckTicks, this.bot.entity.position.y);
             return;
         }
 
         // 2. Dégager le corps
         const blkBody = this.bot.blockAt(targetBody);
         if (blkBody && blkBody.boundingBox === 'block') {
-            await this.bot.dig(blkBody);
-            if (movementBrain) movementBrain.recordDigSuccess(this.bot, 'DIG_BODY', this.targetY, forward, this._stuckTicks, this.bot.entity.position.y);
+            if (await this._safeDig(blkBody) && movementBrain) movementBrain.recordDigSuccess(this.bot, 'DIG_BODY', this.targetY, forward, this._stuckTicks, this.bot.entity.position.y);
             return;
         }
 
         // 2b. Bloc au-dessus du bot (cas rare)
         const currentHead = this.bot.blockAt(this.bot.entity.position.offset(0, 1, 0).floored());
         if (currentHead && currentHead.boundingBox === 'block') {
-            await this.bot.dig(currentHead);
+            await this._safeDig(currentHead);
             return;
         }
 
@@ -331,9 +415,9 @@ class DigDown extends Task {
             const blkBelowTarget = this.bot.blockAt(targetFloor2);
 
             if (!blkBelowTarget || blkBelowTarget.boundingBox !== 'block') {
-                if (blkBelowTarget && (blkBelowTarget.name.includes('lava') || blkBelowTarget.name.includes('water'))) {
-                    console.log('[DigDown] Liquide détecté sous le chemin, arrêt.');
-                    this.complete();
+                if (this._isLiquid(blkBelowTarget)) {
+                    console.log('[DigDown] Liquide sous la marche -> contournement.');
+                    this._stuckTicks = 25; // force une rotation au prochain tick
                     return;
                 }
 
@@ -341,27 +425,15 @@ class DigDown extends Task {
                 console.log('[DigDown] Vide détecté sous le chemin, tentative de pont...');
             }
 
-            await this.bot.dig(blkFloor);
+            if (!(await this._safeDig(blkFloor))) return;
             if (movementBrain) movementBrain.recordDigSuccess(this.bot, 'DIG_FLOOR', this.targetY, forward, this._stuckTicks, this.bot.entity.position.y);
 
             await this.bot.waitForTicks(2);
             const freshBlkBelow = this.bot.blockAt(targetFloor2);
-            if (!freshBlkBelow || freshBlkBelow.boundingBox !== 'block') {
-                const placeable = this.bot.inventory.items().find(i =>
-                    i.name === 'cobblestone' || i.name === 'dirt' || i.name === 'stone' ||
-                    i.name === 'andesite'    || i.name === 'diorite' || i.name === 'granite'
-                );
-                if (placeable) {
-                    try {
-                        await this.bot.equip(placeable, 'hand');
-                        const refBlock = this.bot.blockAt(botPos.offset(0, -2, 0));
-                        if (refBlock && refBlock.boundingBox === 'block') {
-                            await this.bot.placeBlock(refBlock, forward);
-                            console.log('[DigDown] Pont posé.');
-                        }
-                    } catch (e) {
-                        console.log(`[DigDown] Échec du pont : ${e.message}`);
-                    }
+            if (!this._isSolid(freshBlkBelow)) {
+                if (!(await this._fillVoid(targetFloor2))) {
+                    // Impossible de combler : ne pas descendre ici, tourner au prochain tick
+                    this._stuckTicks = 25;
                 }
             }
             return;

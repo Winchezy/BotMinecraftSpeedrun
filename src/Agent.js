@@ -7,6 +7,7 @@ const BuildNetherPortal = require('./tasks/BuildNetherPortal');
 const FindStronghold = require('./tasks/FindStronghold');
 const FightDragon = require('./tasks/FightDragon');
 const MoveToSurface = require('./tasks/MoveToSurface');
+const GetFood = require('./tasks/GetFood');
 const LocalBrain = require('./LocalBrain');
 const fs = require('fs');
 const path = require('path');
@@ -17,7 +18,9 @@ class Agent {
         this.currentTask = null;
         this.mcData = require('minecraft-data')(bot.version);
         this.stage = 'EARLY_GAME'; // EARLY_GAME, IRON, DIAMOND, NETHER, STRONGHOLD, END
-        this.failedTasks = {}; // Track failed tasks to avoid infinite loops
+        this.failedTasks = {}; // Echecs CONSECUTIFS par tache (reset au succes de la tache)
+        this.lastFailedTask = null; // Derniere tache ayant echoue (pour le disjoncteur)
+        this.recoverAttempts = 0;   // Escalade des recuperations du disjoncteur
         this._redundancyAttempts = 0; // Limite les tentatives de craft de pioche de secours
         this._pendingRecord = null; // Reward-based recording: état avant la tâche en cours
 
@@ -55,14 +58,68 @@ class Agent {
             return;
         }
 
+        // ===== DANS L'EAU : on laisse Survival gerer SEUL =====
+        // Le systeme Survival (physicsTick) gere l'evasion de l'eau en parallele. Si une
+        // tache continue a creuser/pathfinder en meme temps, les deux se battent : le dig
+        // est annule, le pathfinder est stoppe, et le bot se noie. Tant qu'on est dans
+        // l'eau on met donc la tache EN PAUSE (sans la faire echouer) ; elle reprend au sec.
+        {
+            const p = this.bot.entity.position;
+            const feet = this.bot.blockAt(p.floored());
+            const head = this.bot.blockAt(p.offset(0, 1.6, 0).floored());
+            const inWater = (feet && feet.name.includes('water')) || (head && head.name.includes('water'));
+            if (inWater) {
+                try { this.bot.stopDigging(); } catch (e) { }
+                return; // Survival s'occupe de sortir de l'eau, sans interference.
+            }
+        }
+
+        // ===== BESOIN VITAL : NOURRITURE (verifie a CHAQUE tick) =====
+        // DOIT etre ici, hors de runStateMachine() : une tache longue (DigDown...) peut
+        // monopoliser currentTask indefiniment et empecher la state machine de tourner ->
+        // le bot mourrait de faim sans jamais re-evaluer. On interrompt donc meme
+        // une tache en cours quand la faim devient critique.
+        if (this.bot.food <= 6 && !(this.currentTask instanceof GetFood)) {
+            if (this.currentTask) {
+                try { this.bot.stopDigging(); } catch (e) { }
+                try { this.bot.pathfinder.stop(); } catch (e) { }
+                try { this.bot.clearControlStates(); } catch (e) { }
+            }
+            console.log(`[Agent] Faim critique ${this.bot.food}/20 -> interruption pour GetFood`);
+            this._pendingRecord = null; // la tache interrompue ne doit pas etre recompensee
+            this.currentTask = new GetFood(this.bot);
+        }
+
+        if (this.currentTask) {
+            console.log(`[DEBUG] Tick: Current task is ${this.currentTask.name}, done=${this.currentTask.isDone()}`);
+        } else {
+            console.log(`[DEBUG] Tick: No current task`);
+        }
+
         // Si une tâche est en cours, la laisser finir
         if (this.currentTask && !this.currentTask.isDone()) {
             try {
-                await this.currentTask.run();
+                // WATCHDOG : une tache qui se FIGE (await jamais resolu, ex: bot.dig
+                // bloque par l'eau / une grotte) contournerait le disjoncteur, qui ne
+                // s'evalue que dans runStateMachine() -> jamais atteint si run() ne rend pas
+                // la main. On borne donc chaque run() dans le temps.
+                const WATCHDOG_MS = 45000;
+                await Promise.race([
+                    this.currentTask.run(),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('Watchdog: tache figee >45s')), WATCHDOG_MS))
+                ]);
             } catch (err) {
                 console.log(`Task Error: ${err.message}`);
+                // En cas de blocage : couper proprement minage / pathfinding / controles.
+                try { this.bot.stopDigging(); } catch (e) { }
+                try { this.bot.pathfinder.stop(); } catch (e) { }
+                try { this.bot.clearControlStates(); } catch (e) { }
+                // Track failed tasks (un gel compte plus lourd qu'un simple echec).
                 const taskName = this.currentTask.name;
-                this.failedTasks[taskName] = (this.failedTasks[taskName] || 0) + 1;
+                const strike = /Watchdog/.test(err.message) ? 3 : 1;
+                this.failedTasks[taskName] = (this.failedTasks[taskName] || 0) + strike;
+                this.lastFailedTask = taskName;
+                this._pendingRecord = null; // Échec → on ne garde pas l'exemple
                 this.currentTask = null;
             }
             return;
@@ -73,10 +130,17 @@ class Agent {
             if (this.currentTask.hasFailed) {
                 const taskName = this.currentTask.name;
                 this.failedTasks[taskName] = (this.failedTasks[taskName] || 0) + 1;
+                this.lastFailedTask = taskName;
                 this._pendingRecord = null; // Échec → on ne garde pas l'exemple
-            } else if (this._pendingRecord) {
-                this._saveProgressionExample(this._pendingRecord.actionName, this._pendingRecord.input);
-                this._pendingRecord = null;
+            } else {
+                // Tache reussie : on remet a zero son compteur d'echec + le disjoncteur.
+                this.failedTasks[this.currentTask.name] = 0;
+                this.lastFailedTask = null;
+                this.recoverAttempts = 0;
+                if (this._pendingRecord) {
+                    this._saveProgressionExample(this._pendingRecord.actionName, this._pendingRecord.input);
+                    this._pendingRecord = null;
+                }
             }
             this.currentTask = null;
         }
@@ -135,6 +199,75 @@ class Agent {
             }
         }
 
+    }
+
+    // Recuperation generique declenchee par le disjoncteur quand une tache boucle.
+    // Escalade : bois (dependance universelle) -> relocalisation sol plat -> wander + reset.
+    // Retourne true si une action de recuperation a ete engagee.
+    async recover(stuckTask, inv, has, count) {
+        const { goals } = require('mineflayer-pathfinder');
+        this.recoverAttempts = (this.recoverAttempts || 0) + 1;
+
+        // Apres plusieurs recuperations infructueuses : wander lointain + reset complet.
+        if (this.recoverAttempts >= 4) {
+            console.log("[Agent][Recover] Trop de recuperations -> wander lointain + reset complet des echecs.");
+            const p = this.bot.entity.position;
+            const ang = Math.random() * Math.PI * 2;
+            try {
+                await this.bot.pathfinder.goto(new goals.GoalNear(p.x + Math.cos(ang) * 40, p.y, p.z + Math.sin(ang) * 40, 4));
+            } catch (e) { }
+            this.failedTasks = {};
+            this.recoverAttempts = 0;
+            return true;
+        }
+
+        // 1) Le bois est la dependance universelle (planches, batons, manches, combustible).
+        //    Si on en manque ET que ce n'est pas GetWood lui-meme qui boucle, on va en chercher.
+        if (stuckTask !== 'GetWood' && count('log') < 1 && count('planks') < 2) {
+            console.log("[Agent][Recover] Manque de bois -> GetWood.");
+            this.currentTask = new GetWood(this.bot, 3);
+            return true;
+        }
+
+        // 2) Sinon, changer physiquement d'endroit : echappe les perchoirs / terrains
+        //    qui bloquent le pathfinder. On vise un sol plat un peu eloigne.
+        const ground = this.bot.findBlock({
+            matching: [this.mcData.blocksByName.grass_block.id, this.mcData.blocksByName.dirt.id],
+            maxDistance: 48,
+            useExtraInfo: (b) => {
+                const a1 = this.bot.blockAt(b.position.offset(0, 1, 0));
+                const a2 = this.bot.blockAt(b.position.offset(0, 2, 0));
+                if (!a1 || !a2 || a1.name !== 'air' || a2.name !== 'air') return false;
+                if (b.position.distanceTo(this.bot.entity.position) <= 8) return false;
+                // Rejeter les emplacements proches de l'eau : DigDown (et le pathfinder)
+                // detestent l'eau. On veut une colonne seche pour repartir proprement.
+                const around = [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, -1, 0],
+                [1, 1, 0], [-1, 1, 0], [0, 1, 1], [0, 1, -1]];
+                for (const o of around) {
+                    const nb = this.bot.blockAt(b.position.offset(o[0], o[1], o[2]));
+                    if (nb && nb.name.includes('water')) return false;
+                }
+                return true;
+            }
+        });
+        if (ground) {
+            console.log(`[Agent][Recover] Relocalisation vers sol plat ${ground.position}.`);
+            try {
+                await this.bot.pathfinder.goto(new goals.GoalNear(ground.position.x, ground.position.y + 1, ground.position.z, 1));
+            } catch (e) {
+                console.log(`[Agent][Recover] Relocalisation echouee: ${e.message}`);
+            }
+            return true;
+        }
+
+        // 3) Pas de sol plat trouve : wander court pour debloquer.
+        console.log("[Agent][Recover] Aucun sol plat -> wander court.");
+        const p = this.bot.entity.position;
+        const ang = Math.random() * Math.PI * 2;
+        try {
+            await this.bot.pathfinder.goto(new goals.GoalNear(p.x + Math.cos(ang) * 20, p.y, p.z + Math.sin(ang) * 20, 3));
+        } catch (e) { }
+        return true;
     }
 
     // ==================== REWARD-BASED RECORDING ====================
@@ -276,28 +409,56 @@ class Agent {
             return i.name.includes(name);
         }).reduce((a, b) => a + b.count, 0);
 
+        // ===== AUTO-DEDUCTION DE L'ETAPE (anti "recommencer au debut") =====
+        // L'inventaire est conserve cote serveur entre deux lancements. On deduit
+        // l'etape minimale a partir du MEILLEUR materiel possede, et on n'avance
+        // jamais en arriere. Evite de refaire l'early game quand on a deja, p.ex.,
+        // une pioche en fer (mais plus de pioche en pierre).
+        const STAGE_ORDER = ['EARLY_GAME', 'IRON', 'DIAMOND', 'NETHER', 'STRONGHOLD', 'END'];
+        const atLeast = (target) => {
+            if (STAGE_ORDER.indexOf(target) > STAGE_ORDER.indexOf(this.stage)) {
+                console.log(`[Agent] Materiel detecte -> saut direct a l'etape ${target} (pas de retour en arriere).`);
+                this.stage = target;
+            }
+        };
+        if (has('diamond_pickaxe')) atLeast('NETHER');
+        else if (has('iron_pickaxe') && has('iron_sword')) atLeast('DIAMOND');
+        else if (has('iron_pickaxe')) atLeast('IRON'); // reste en IRON pour crafter l'épée
+
+        // ===== DISJONCTEUR GLOBAL ANTI-BOUCLE =====
+        // Filet de securite pour TOUTE la classe de bugs "tache qui echoue en boucle".
+        // Les handlers d'etape ont leurs propres seuils (3, 5/6) ; ce seuil plus haut (8)
+        // n'intervient qu'en dernier recours, quand rien d'autre n'a debloque la situation.
+        const LOOP_THRESHOLD = 8;
+        if (this.lastFailedTask && (this.failedTasks[this.lastFailedTask] || 0) >= LOOP_THRESHOLD) {
+            const stuckTask = this.lastFailedTask;
+            console.log(`[Agent] DISJONCTEUR: '${stuckTask}' a echoue ${this.failedTasks[stuckTask]} fois d'affilee -> recuperation.`);
+            this.failedTasks[stuckTask] = 0;
+            this.lastFailedTask = null;
+            if (await this.recover(stuckTask, inv, has, count)) return;
+        }
+
+        // ===== PRIORITE VITALE : NOURRITURE =====
+        // A 0 de faim le bot prend des degats et ne regenere pas -> on mange/chasse
+        // AVANT toute progression. (Le disjoncteur attrape GetFood s'il boucle.)
+        // Pas de poulet cru (effet Hunger) ni chair putrefiee -> pas d'empoisonnement.
+        const EDIBLE = ['cooked_beef', 'cooked_porkchop', 'cooked_chicken', 'cooked_mutton',
+            'cooked_rabbit', 'cooked_cod', 'cooked_salmon', 'bread', 'apple', 'golden_apple',
+            'baked_potato', 'carrot', 'melon_slice', 'beef', 'porkchop', 'mutton',
+            'rabbit', 'cod', 'salmon'];
+        const hasEdible = inv.some(i => EDIBLE.includes(i.name));
+        if ((hasEdible && this.bot.food < 16) || this.bot.food <= 6) {
+            console.log(`[Agent] Faim ${this.bot.food}/20 -> GetFood (priorite vitale)`);
+            this.currentTask = new GetFood(this.bot);
+            return;
+        }
+
         // ── Vérification générale : remonter à la surface si nécessaire ──────────
         const surfaceReason = this._requiresSurface(inv, has, count);
         if (surfaceReason) {
             console.log(`[Agent] Surface requise (${surfaceReason}) → MoveToSurface`);
             this.currentTask = new MoveToSurface(this.bot);
             return;
-        }
-
-        // ── Urgence nourriture : chercher un animal à tuer si mourant de faim ────
-        const foodItems = ['flesh', 'beef', 'pork', 'bread', 'apple', 'carrot', 'potato', 'chicken', 'mutton', 'rabbit', 'cod', 'salmon'];
-        const hasFood = inv.some(i => foodItems.some(f => i.name.includes(f)));
-        if (!hasFood && this.bot.food <= 3 && !['NETHER', 'STRONGHOLD', 'END'].includes(this.stage)) {
-            const passiveMobs = ['cow', 'pig', 'sheep', 'chicken'];
-            const nearbyAnimal = this.bot.nearestEntity(e =>
-                e && e.name && passiveMobs.some(m => e.name.toLowerCase() === m) &&
-                e.position && this.bot.entity.position.distanceTo(e.position) < 32
-            );
-            if (nearbyAnimal) {
-                console.log(`[Agent] FAIM CRITIQUE — chasse ${nearbyAnimal.name} pour nourriture`);
-                this.currentTask = new FightMob(this.bot, nearbyAnimal.name, 1);
-                return;
-            }
         }
 
         // ========== STAGE: EARLY_GAME ==========
@@ -325,6 +486,7 @@ class Agent {
                 return;
             }
             console.log("[Agent] Iron stage complete! Moving to DIAMOND stage.");
+            this.failedTasks = {}; // Reset des echecs en changeant d'etape
             this.stage = 'DIAMOND';
         }
 
@@ -565,6 +727,24 @@ class Agent {
         // Ensure backup stone pickaxe if we are deep down
         if (await this.ensurePickaxeRedundancy(inv, has, count)) return;
 
+        // 0. Recuperer le fer reste DANS LE FOUR (ex: fonte interrompue par un crash/restart)
+        //    AVANT de re-miner. Sinon on ne compte que l'inventaire et on re-mine pour rien.
+        //    Symptome : on a deja des lingots mais pas 6, et plus de minerai brut en main.
+        //    Si le four est vide, SmeltTask echoue -> on tombe sur l'etape de minage.
+        const smeltCollectName = 'Smelt_raw_iron_to_iron_ingot';
+        if (count('iron_ingot') >= 1 && count('iron_ingot') < 6 && count('raw_iron') === 0
+            && (this.failedTasks[smeltCollectName] || 0) === 0) {
+            const furnaceNearby = this.bot.findBlock({
+                matching: this.mcData.blocksByName.furnace?.id,
+                maxDistance: 16
+            });
+            if (furnaceNearby) {
+                console.log("[Agent] Lingots manquants + four a proximite -> recuperation de la fonte avant de re-miner.");
+                this.currentTask = new SmeltTask(this.bot, 'raw_iron', 'iron_ingot', 6);
+                return;
+            }
+        }
+
         // 1. Mine Iron Ore (need 6 for pickaxe + shield + sword)
         if (count('raw_iron') < 6 && count('iron_ingot') < 6) {
             // Si du minerai est déjà accessible à portée, le miner directement
@@ -678,9 +858,34 @@ class Agent {
         if (count('iron_ingot') < 6) {
             const smeltTaskName = 'Smelt_raw_iron_to_iron_ingot';
             if ((this.failedTasks[smeltTaskName] || 0) > 2) {
-                console.log("[Agent] Smelting failed multiple times. Trying to move to better location.");
+                console.log("[Agent] Smelting failed multiple times. Relocating to flat ground.");
                 this.failedTasks[smeltTaskName] = 0;
-                this.currentTask = new MoveToSurface(this.bot);
+
+                // Apres MoveToSurface, le bot finit souvent perche sur un pilier d'1 bloc
+                // (a travers les arbres) ou aucun fourneau ne peut etre pose. On rejoint un
+                // vrai sol plat au lieu de relancer MoveToSurface (no-op quand deja en surface).
+                const ground = this.bot.findBlock({
+                    matching: [this.mcData.blocksByName.grass_block.id, this.mcData.blocksByName.dirt.id],
+                    maxDistance: 32,
+                    useExtraInfo: (b) => {
+                        const a1 = this.bot.blockAt(b.position.offset(0, 1, 0));
+                        const a2 = this.bot.blockAt(b.position.offset(0, 2, 0));
+                        return a1 && a2 && a1.name === 'air' && a2.name === 'air';
+                    }
+                });
+
+                if (ground) {
+                    console.log(`[Agent] Relocating to flat ground at ${ground.position}`);
+                    try {
+                        const { goals } = require('mineflayer-pathfinder');
+                        await this.bot.pathfinder.goto(new goals.GoalNear(ground.position.x, ground.position.y + 1, ground.position.z, 1));
+                    } catch (e) {
+                        console.log(`[Agent] Relocation failed: ${e.message}`);
+                    }
+                } else {
+                    // Aucun sol plat a proximite : fallback historique
+                    this.currentTask = new MoveToSurface(this.bot);
+                }
                 return;
             }
 
@@ -749,10 +954,11 @@ class Agent {
         await this.ensureTable(inv, has, count);
         if (this.currentTask) return;
 
+        // Manche necessaire : on remonte la chaine batons <- planches <- bois.
+        // (L'epee en fer est volontairement laissee de cote : une fois la pioche en fer
+        // obtenue on passe a DIAMOND, pour ne pas re-declencher de collecte de bois.)
         if (count('stick') < 2) {
-            // Do we have planks?
             if (count('planks') < 2) {
-                // Do we have logs?
                 if (count('log') > 0) {
                     const logItem = inv.find(i => i.name.includes('log') && !i.name.includes('stripped'));
                     let plankType = logItem ? `${logItem.name.replace('_log', '')}_planks` : 'oak_planks';

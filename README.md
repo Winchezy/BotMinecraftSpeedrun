@@ -156,5 +156,5 @@ scripts/
 ├── train_digdown.js   # Entraîne le modèle DigDown
 └── train_surface.js   # Entraîne le modèle MoveToSurface
 
-data/                  # Datasets et modèles générés (non versionné)
+data/                  # Datasets et modèles générés
 ```

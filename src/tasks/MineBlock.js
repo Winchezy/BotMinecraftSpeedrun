@@ -33,30 +33,8 @@ class MineBlock extends Task {
             return;
         }
 
-        // Count current items - handle ore -> raw conversions
-        const currentCount = this.bot.inventory.items()
-            .filter(i => {
-                // Exclude tools
-                if (i.name.includes('pickaxe') || i.name.includes('sword') ||
-                    i.name.includes('axe') || i.name.includes('shovel') || i.name.includes('hoe')) {
-                    return false;
-                }
-
-                // Special cases: ore drops
-                if (this.blockName === 'iron_ore' && i.name === 'raw_iron') return true;
-                if (this.blockName === 'gold_ore' && i.name === 'raw_gold') return true;
-                if (this.blockName === 'copper_ore' && i.name === 'raw_copper') return true;
-                if (this.blockName === 'coal_ore' && i.name === 'coal') return true;
-                if (this.blockName === 'stone') {
-                    if (i.name === 'cobblestone') return true;
-                    if (i.name === 'cobbled_deepslate') return true;
-                    if (i.name === 'blackstone') return true;
-                }
-
-                // Default: match by name
-                return i.name.includes(this.blockName);
-            })
-            .reduce((a, b) => a + b.count, 0);
+        // Count current items - handle ore -> drop conversions (see countCollected)
+        const currentCount = this.countCollected();
 
         console.log(`[${this.name}] Current: ${currentCount}/${this.count}`);
 
@@ -275,6 +253,44 @@ class MineBlock extends Task {
         }
     }
 
+    // Compte les objets de l'inventaire qui valident l'objectif de minage.
+    // Les minerais lâchent un objet de nom DIFFERENT du bloc (coal_ore -> coal,
+    // diamond_ore -> diamond...). Sans ce mapping, le compteur reste a 0 et le bot
+    // mine la veine a l'infini. C'est l'unique source de verite (run + staircase).
+    countCollected() {
+        // minerai (blockName) -> objet réellement lâché
+        const oreDrops = {
+            iron_ore: 'raw_iron',
+            gold_ore: 'raw_gold',
+            copper_ore: 'raw_copper',
+            coal_ore: 'coal',
+            diamond_ore: 'diamond',
+            redstone_ore: 'redstone',
+            lapis_ore: 'lapis_lazuli',
+            emerald_ore: 'emerald',
+        };
+
+        return this.bot.inventory.items().reduce((total, i) => {
+            // Exclure les outils
+            if (i.name.includes('pickaxe') || i.name.includes('sword') ||
+                i.name.includes('axe') || i.name.includes('shovel') || i.name.includes('hoe')) {
+                return total;
+            }
+
+            const drop = oreDrops[this.blockName];
+            if (drop) return total + (i.name === drop ? i.count : 0);
+
+            if (this.blockName === 'stone') {
+                const isStone = i.name === 'cobblestone' || i.name === 'cobbled_deepslate' ||
+                    i.name === 'blackstone' || i.name === 'stone';
+                return total + (isStone ? i.count : 0);
+            }
+
+            // Défaut : correspondance par nom (ex: oak_log)
+            return total + (i.name.includes(this.blockName) ? i.count : 0);
+        }, 0);
+    }
+
     // Simple staircase mining - dig forward and down
     async mineStaircase() {
         console.log(`[${this.name}] Starting simple staircase mining`);
@@ -283,18 +299,7 @@ class MineBlock extends Task {
             // Dig 30 steps in a staircase pattern
             for (let i = 0; i < 30; i++) {
                 // Check if we have enough
-                const currentCount = this.bot.inventory.items()
-                    .filter(i => {
-                        if (i.name.includes('pickaxe') || i.name.includes('sword') ||
-                            i.name.includes('axe') || i.name.includes('shovel') || i.name.includes('hoe')) {
-                            return false;
-                        }
-                        return i.name.includes(this.blockName) ||
-                            (this.blockName === 'stone' && i.name === 'cobblestone') ||
-                            (this.blockName === 'coal_ore' && i.name === 'coal') ||
-                            (this.blockName === 'iron_ore' && i.name === 'raw_iron');
-                    })
-                    .reduce((a, b) => a + b.count, 0);
+                const currentCount = this.countCollected();
 
                 if (currentCount >= this.count) {
                     console.log(`[${this.name}] Found enough while mining!`);
