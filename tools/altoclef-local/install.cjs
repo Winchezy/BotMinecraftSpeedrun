@@ -3,7 +3,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 const root = path.resolve(__dirname, '../..');
-const libs = path.join(root, '.bot-state/altoclef-source-019/altoclef-0.19/versions/1.18.2/build/libs');
+const libs = path.join(root, 'altoclef/versions/1.18.2/build/libs');
 const artifact = path.join(libs, 'altoclef-1.18.2-0.19-local.3.jar');
 if (!fs.existsSync(artifact)) throw Error('JAR local compilé absent');
 const artifactHash = crypto.createHash('sha256').update(fs.readFileSync(artifact)).digest('hex');

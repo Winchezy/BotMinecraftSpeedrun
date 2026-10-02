@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const source = path.resolve(__dirname, '../../.bot-state/altoclef-source-019/altoclef-0.19');
+const source = path.resolve(__dirname, '../../altoclef');
 const files = [
   'LICENSE', 'build.gradle', 'settings.gradle.kts', 'gradle.properties', 'local-tests/LocalSafetyPolicyTest.java', 'local-tests/WitherDefensePolicyTest.java',
   ...[

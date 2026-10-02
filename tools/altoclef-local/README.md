@@ -1,6 +1,6 @@
 # Corrections locales AltoClef MiranCZ 0.19
 
-Les sources modifiées sont dans `.bot-state/altoclef-source-019/altoclef-0.19`.
+Les sources complètes modifiées sont dans le dossier `altoclef/` à la racine du projet (suivi par Git ; les compilations, caches et JAR en sont exclus par son `.gitignore`).
 Une copie des fichiers modifiés et de la licence est conservée dans `tools/altoclef-local/overlay`.
 Cette copie se met à jour avec `node tools/altoclef-local/save-overlay.cjs`.
 Base : archive du tag 0.19 de https://github.com/MiranCZ/altoclef (licence MIT conservée).

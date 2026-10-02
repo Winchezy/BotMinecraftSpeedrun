@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 $taskRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
-$taskSource = Join-Path $taskRoot '.bot-state/altoclef-source-019/altoclef-0.19'
+$taskSource = Join-Path $taskRoot 'altoclef'
 $taskJdk = Get-ChildItem (Join-Path $taskRoot '.bot-state/build-tools') -Directory | Where-Object Name -Like 'jdk-21*' | Select-Object -First 1
 if (-not $taskJdk) { throw 'JDK 21 local absent' }
 $taskClasses = Join-Path $taskSource 'local-tests/classes'

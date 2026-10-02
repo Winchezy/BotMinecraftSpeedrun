@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 $taskRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
-$taskJar = Join-Path $taskRoot '.bot-state/altoclef-source-019/altoclef-0.19/versions/1.18.2/build/libs/altoclef-1.18.2-0.19-local.3.jar'
+$taskJar = Join-Path $taskRoot 'altoclef/versions/1.18.2/build/libs/altoclef-1.18.2-0.19-local.3.jar'
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $taskArchive = [System.IO.Compression.ZipFile]::OpenRead($taskJar)
 try {
